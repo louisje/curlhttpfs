@@ -200,7 +200,7 @@ long read_curl_buffer(size_t size, off_t offset, httpfs_buffer_t *httpfs_buf)
 		res = httpfs_buf->len;
 	}
 	//pthread_mutex_unlock(&httpfs_buf->mutex);
-	//curl_easy_cleanup(curl);
+	curl_easy_cleanup(curl);
 	return res;
 }
 
