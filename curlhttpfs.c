@@ -47,10 +47,6 @@ struct httpfs_file {
 	0
 };
 
-//char * curl_buffer = NULL;
-//int curl_buffer_count = 0;
-//static pthread_mutex_t curl_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 typedef struct httpfs_buffer {
 	char *p;
 	long len;
@@ -151,7 +147,6 @@ long read_curl_buffer(size_t size, off_t offset, httpfs_buffer_t *httpfs_buf)
 	long res;
 	CURL *curl = NULL;
 
-	//curl_buffer_count = 0;
 	sprintf(range, "%llu-%llu", (unsigned long long)offset, (unsigned long long)offset + (unsigned long long)size - 1);
 
 	curl = curl_easy_init();
@@ -159,7 +154,6 @@ long read_curl_buffer(size_t size, off_t offset, httpfs_buffer_t *httpfs_buf)
 	{
 		return -1;
 	}
-	//pthread_mutex_lock(&httpfs_buf->mutex);
 	curl_easy_setopt(curl, CURLOPT_URL, options.target_url);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, my_write_callback);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, httpfs_buf);
@@ -175,7 +169,6 @@ long read_curl_buffer(size_t size, off_t offset, httpfs_buffer_t *httpfs_buf)
 	{
 		res = httpfs_buf->len;
 	}
-	//pthread_mutex_unlock(&httpfs_buf->mutex);
 	curl_easy_cleanup(curl);
 	return res;
 }
@@ -226,17 +219,13 @@ static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
 
 	httpfs_buf.p = buf;
 	httpfs_buf.len = 0;
-	//httpfs_buf.mutex = PTHREAD_MUTEX_INITIALIZER;
 
-	//pthread_mutex_lock(&curl_buffer_mutex);
 	if (read_curl_buffer(size, offset, &httpfs_buf) < 0)
 	{
-		//pthread_mutex_unlock(&curl_buffer_mutex);
 		return -ENOENT;
 	}
 	else
 	{
-		//pthread_mutex_unlock(&curl_buffer_mutex);
 		return size;
 	}
 }
