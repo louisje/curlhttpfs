@@ -26,20 +26,18 @@
 
 struct options {
 	char *target_url;
+	char *target_filename;
 } options;
 
 #define MY_OPT_KEY(t, p, v) { t, offsetof(struct options, p), v }
 
-static struct fuse_opt my_opts[] = {
+static struct fuse_opt httpfs_opts[] = {
 	MY_OPT_KEY("url=%s", target_url, 0),
+	MY_OPT_KEY("filename=%s", target_filename, 0),
 	FUSE_OPT_END
 };
 
 size_t my_write_callback(void *ptr, size_t size, size_t nmemb, void *stream);
-
-//static const char target_url[255] = "http://202.5.224.193/louis/idownloader.wsdl";
-//static char target_filename[255] = "/";
-//static double target_size = 0;
 
 struct httpfs_file {
 	char filename[255];
@@ -127,32 +125,10 @@ static int httpfs_open(const char *path, struct fuse_file_info *fi)
 	{
 		return -ENOENT;
 	}
+	/*
 	if ((fi->flags & 3) != O_RDONLY)
 	{
 		return -EACCES;
-	}
-	/*
-	if (!curl)
-	{
-		curl_easy_cleanup(curl);
-	}
-	curl = curl_easy_init();
-	if (!curl)
-	{
-		return -ENOENT;
-	}
-	curl_easy_setopt(curl, CURLOPT_URL, options.target_url);
-	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0);
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0);
-	curl_easy_setopt(curl, CURLOPT_NOBODY, 1);
-	if (curl_easy_perform(curl) != CURLE_OK)
-	{
-		return -ENOENT;
-	}
-	if (curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &httpfs_file.size) != CURLE_OK)
-	{
-		return -ENOENT;
 	}
 	*/
 	return 0;
@@ -280,7 +256,7 @@ int main(int argc, char *argv[])
 
 	memset(&options, 0, sizeof(struct options));
 
-	if (fuse_opt_parse(&args, &options, my_opts, NULL) == -1)
+	if (fuse_opt_parse(&args, &options, httpfs_opts, NULL) == -1)
 	{
 		fprintf(stderr, "ERROR: Fail to parse arguments!\n");
 		return -1;
@@ -297,13 +273,21 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "ERROR: Target URL is too long!\n");
 		return -1;
 	}
-	strcpy(temp_url, options.target_url);
-	str = strrchr(temp_url, '?');
-	if (str)
+
+	if (!options.target_filename || !(*options.target_filename))
 	{
-		*str = '\0';
+		strcpy(temp_url, options.target_url);
+		str = strrchr(temp_url, '?');
+		if (str)
+		{
+			*str = '\0';
+		}
+		strcat(httpfs_file.filename, basename(temp_url));
 	}
-	strcat(httpfs_file.filename, basename(temp_url));
+	else
+	{
+		strcat(httpfs_file.filename, options.target_filename);
+	}
 
 	if (fuse_main(args.argc, args.argv, &httpfs_oper, NULL))
 	{
