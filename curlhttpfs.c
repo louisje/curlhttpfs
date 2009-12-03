@@ -42,6 +42,7 @@ size_t my_write_callback(void *ptr, size_t size, size_t nmemb, void *stream);
 struct httpfs_file {
 	char filename[255];
 	double size;
+	long filetime;
 } httpfs_file = {
 	"/",
 	0
@@ -50,7 +51,6 @@ struct httpfs_file {
 typedef struct httpfs_buffer {
 	char *p;
 	long len;
-	pthread_mutex_t mutex;
 } httpfs_buffer_t;
 
 static int httpfs_getattr(const char *path, struct stat *stbuf)
@@ -58,7 +58,6 @@ static int httpfs_getattr(const char *path, struct stat *stbuf)
 	int res = 0;
 	CURL *curl;
 	CURLcode code;
-	long filetime = 0;
 
 	memset(stbuf, 0, sizeof(struct stat));
 	if (strcmp(path, "/") == 0) {
@@ -80,10 +79,10 @@ static int httpfs_getattr(const char *path, struct stat *stbuf)
 		{
 			return -ENOENT;
 		}
-		code = curl_easy_getinfo(curl, CURLINFO_FILETIME, &filetime);
+		code = curl_easy_getinfo(curl, CURLINFO_FILETIME, &httpfs_file.filetime);
 		if (code == CURLE_OK)
 		{
-			stbuf->st_mtime = (time_t)filetime;
+			stbuf->st_mtime = (time_t)httpfs_file.filetime;
 		}
 		code = curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &httpfs_file.size);
 		if (code == CURLE_OK)
