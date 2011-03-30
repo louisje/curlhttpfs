@@ -40,7 +40,7 @@ static struct fuse_opt httpfs_opts[] = {
 size_t my_write_callback(void *ptr, size_t size, size_t nmemb, void *stream);
 
 struct httpfs_file {
-	char filename[255];
+	char filename[512];
 	double size;
 	long filetime;
 } httpfs_file = {
@@ -238,7 +238,7 @@ static struct fuse_operations httpfs_oper = {
 
 int main(int argc, char *argv[])
 {
-	char temp_url[255];
+	char temp_url[512];
 	char *str;
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
 
@@ -256,7 +256,7 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	if (strlen(options.target_url) > 255)
+	if (strlen(options.target_url) > 512)
 	{
 		fprintf(stderr, "ERROR: Target URL is too long!\n");
 		return -1;
