@@ -45,6 +45,7 @@ struct httpfs_file {
 	long filetime;
 } httpfs_file = {
 	"/",
+	0,
 	0
 };
 
@@ -95,7 +96,7 @@ static int httpfs_getattr(const char *path, struct stat *stbuf, struct fuse_file
 	}
 	else
 	{
-		res = -ENOENT;
+		return -ENOENT;
 	}
 	return 0;
 }
