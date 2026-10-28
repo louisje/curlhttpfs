@@ -73,3 +73,11 @@ No code or build files were changed during this audit.
 ## Audit status update (2026-10-28)
 
 Since the original inventory above, commits have begun adapting the code to FUSE 3 and modern libcurl, have replaced the hardcoded Makefile dependencies with pkg-config, and added a Linux GitHub Actions build workflow for Ubuntu 22.04/24.04. These are initial changes only; CI success and runtime mount behavior are **not yet confirmed**. The unchecked findings above remain open until separately verified; historical observations describe the original source snapshot.
+
+## CI integration tests (2026-10-28)
+
+- Added `tests/test_mount.py`: a loopback-only, deterministic HTTP server with HEAD and byte-range GET, exercised through an actual FUSE mount.
+- Cases: directory listing and file size, random byte ranges, full sequential read, EOF, and rejection of write opens.
+- `.github/workflows/build.yml` runs the test on Ubuntu 22.04 and 24.04 for each push and pull request, after compilation; requires a working `/dev/fuse` and `fusermount3`.
+- The integration job **fails explicitly** if the runner has no FUSE device; it is not silently skipped. Build success is not equivalent to mount success.
+- This first suite does not yet cover TLS failures, malformed responses, concurrency, timeouts, or simulated interrupted downloads. CI passing must be verified from actual Actions results.
