@@ -118,3 +118,17 @@ Known limitations/follow-up:
 - [ ] Add empty-file handling (a zero-byte object cannot satisfy `bytes=0-0` with 206).
 - [ ] Audit metadata concurrency, FUSE error mapping and integer/size bounds.
 - [ ] Verify this milestone's new tests on both Linux CI runners; do not infer pass status from prior commits.
+
+## Empty files, interrupted transfers, and remote versions (2026-10-29)
+
+- Implemented an empty-file fallback: a 416 response to the initial `bytes=0-0` probe is followed by a HEAD request; only an HTTP 200 with exact `Content-Length: 0` is accepted as an empty resource.
+- For objects with an ETag, remember the probe's ETag, send `If-Match` on subsequent reads, reject HTTP 412 with `ESTALE`, and reject a 206 response whose ETag is absent or changed. This prevents silently combining different versions when a strong ETag is provided. ETag-less resources are **not yet** fully protected against same-size changes.
+- Existing transient retry logic replays the entire range after an interrupted/partial transfer; a deterministic CI test now verifies that behavior.
+- Added integration tests for empty objects, mid-transfer disconnection and ETag changes.
+
+Remaining work:
+- [ ] Support strong versus weak ETag distinctions; weak ETags cannot be used for reliable byte identity.
+- [ ] Consider Last-Modified / If-Unmodified-Since fallback and metadata locking for concurrent first reads.
+- [ ] Handle a HEAD-disabled empty-file server or unsupported HEAD with a separate policy.
+- [ ] Harden unexpected HTTP encoding and oversized error response handling.
+- [ ] Verify GitHub Actions Linux matrix for the above changes, including actual FUSE integration tests.
