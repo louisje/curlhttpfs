@@ -56,7 +56,6 @@ typedef struct httpfs_buffer {
 
 static int httpfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi)
 {
-	int res = 0;
 	(void) fi;
 	CURL *curl;
 	CURLcode code;
@@ -98,7 +97,7 @@ static int httpfs_getattr(const char *path, struct stat *stbuf, struct fuse_file
 	{
 		res = -ENOENT;
 	}
-	return res;
+	return 0;
 }
 
 static int httpfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
@@ -147,6 +146,7 @@ long read_curl_buffer(size_t size, off_t offset, httpfs_buffer_t *httpfs_buf)
 {
 	char range[100];
 	long res;
+	long status = 0;
 	CURL *curl = NULL;
 
 	sprintf(range, "%llu-%llu", (unsigned long long)offset, (unsigned long long)offset + (unsigned long long)size - 1);
@@ -163,13 +163,15 @@ long read_curl_buffer(size_t size, off_t offset, httpfs_buffer_t *httpfs_buf)
 	/* Use libcurl default TLS verification. */
 	
 	curl_easy_setopt(curl, CURLOPT_RANGE, range);
-	if (curl_easy_perform(curl) != CURLE_OK)
+	if (curl_easy_perform(curl) != CURLE_OK ||
+	    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status) != CURLE_OK ||
+	    status != 206)
 	{
 		res = -1;
 	}
 	else
 	{
-		res = httpfs_buf->len;
+		res = (long)httpfs_buf->len;
 	}
 	curl_easy_cleanup(curl);
 	return res;
@@ -202,15 +204,16 @@ static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
 			curl_easy_cleanup(curl);
 			return -EIO;
 		}
-		code = curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &httpfs_file.size);
+		code = curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &httpfs_file.size);
 		if (code != CURLE_OK)
 		{
-			return -ENOENT;
+			curl_easy_cleanup(curl);
+			return -EIO;
 		}
 		curl_easy_cleanup(curl);
 	}
 
-	if (offset >= httpfs_file.size)
+	if (size == 0 || offset >= httpfs_file.size)
 	{
 		return 0;
 	}
