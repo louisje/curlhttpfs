@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end test: loopback HTTP range server -> FUSE mount -> random reads."""
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import http.server
 import os
 from pathlib import Path
@@ -121,6 +122,26 @@ class FuseIntegrationTest(unittest.TestCase):
         with self.assertRaises(PermissionError):
             open(self.mountpoint / "test.bin", "wb")
 
+
+    def test_zero_length_read(self):
+        with open(self.mountpoint / "test.bin", "rb", buffering=0) as f:
+            f.seek(4096)
+            self.assertEqual(f.read(0), b"")
+            self.assertEqual(f.tell(), 4096)
+            self.assertEqual(f.read(32), PAYLOAD[4096:4128])
+
+    def test_concurrent_random_reads(self):
+        offsets = [(i * 7919) % (len(PAYLOAD) - 4096) for i in range(32)]
+
+        def read_at(start):
+            with open(self.mountpoint / "test.bin", "rb", buffering=0) as f:
+                f.seek(start)
+                return f.read(4096)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            received = list(pool.map(read_at, offsets))
+        for start, data in zip(offsets, received):
+            self.assertEqual(data, PAYLOAD[start:start + 4096])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
