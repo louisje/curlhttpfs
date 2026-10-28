@@ -81,3 +81,23 @@ Since the original inventory above, commits have begun adapting the code to FUSE
 - `.github/workflows/build.yml` runs the test on Ubuntu 22.04 and 24.04 for each push and pull request, after compilation; requires a working `/dev/fuse` and `fusermount3`.
 - The integration job **fails explicitly** if the runner has no FUSE device; it is not silently skipped. Build success is not equivalent to mount success.
 - This first suite does not yet cover TLS failures, malformed responses, concurrency, timeouts, or simulated interrupted downloads. CI passing must be verified from actual Actions results.
+
+## Incremental test coverage (2026-10-28)
+
+Added two runnable FUSE integration cases to `tests/test_mount.py`:
+- `test_zero_length_read`: zero-byte read does not advance the offset, and subsequent normal read still returns the right bytes.
+- `test_concurrent_random_reads`: 32 separate random 4 KiB reads over 8 worker threads, checking every returned byte against deterministic source data.
+
+Both tests run automatically under the existing Linux Actions workflow; no new CI configuration is needed.
+
+### Remaining test backlog (not implemented in this iteration)
+
+- [ ] HTTP error behavior: server ignores `Range` and returns `200`; malformed/wrong `Content-Range`, `416`, redirect chains, missing or incorrect `Content-Length`.
+- [ ] Interrupted/short HTTP responses, connection resets, retry policy, timeouts, and delayed responses.
+- [ ] TLS hostname/certificate failures with a local HTTPS fixture.
+- [ ] Remote content changes during a mounted session (ETag / Last-Modified consistency).
+- [ ] Very large sparse/virtual objects and range bounds beyond 4 GiB.
+- [ ] Multi-process concurrent reads, repeated mount/unmount, non-root access and sanitizer runs.
+- [ ] macOS/Windows adapter builds and integration tests after those ports exist.
+
+Do not mark any backlog item done merely because the current basic read tests pass.
