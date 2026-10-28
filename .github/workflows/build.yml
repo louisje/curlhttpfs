@@ -1,0 +1,29 @@
+name: Build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libfuse3-dev libcurl4-openssl-dev
+      - name: Build
+        run: make
+      - name: Smoke test
+        run: |
+          test -x curlhttpfs
+          ./curlhttpfs --help >/dev/null
+      - name: Clean rebuild
+        run: |
+          make clean
+          make
