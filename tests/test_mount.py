@@ -28,8 +28,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.respond(head_only=False)
 
     def respond(self, head_only):
-        if self.path not in ("/test.bin", "/bad.bin", "/flaky.bin"):
+        if self.path not in ("/test.bin", "/bad.bin", "/flaky.bin", "/empty.bin", "/changed.bin", "/interrupted.bin"):
             self.send_error(404)
+            return
+        if self.path == "/empty.bin":
+            if self.headers.get("Range"):
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */0")
+            else:
+                self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
         start, end = 0, len(PAYLOAD) - 1
         requested = self.headers.get("Range")
@@ -54,9 +63,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
+        if self.path == "/changed.bin" and requested:
+            with self.server.request_lock:
+                self.server.changed_requests += 1
+                changed = self.server.changed_requests > 1
+            if changed and self.headers.get("If-Match") == '"v1"':
+                self.send_response(412)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+        if self.path == "/interrupted.bin" and requested:
+            with self.server.request_lock:
+                self.server.interrupted_requests += 1
+                interrupted = self.server.interrupted_requests == 2
+            if interrupted:
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(PAYLOAD)}")
+                self.send_header("Content-Length", str(end - start + 1))
+                self.end_headers()
+                self.wfile.write(PAYLOAD[start:start + 8])
+                self.wfile.flush()
+                self.close_connection = True
+                return
         self.send_response(206 if requested else 200)
         self.send_header("Content-Length", str(end - start + 1))
         self.send_header("Accept-Ranges", "bytes")
+        if self.path == "/changed.bin":
+            self.send_header("ETag", '"v1"')
         if requested:
             self.send_header("Content-Range", f"bytes {start + (1 if self.path == '/bad.bin' else 0)}-{end}/{len(PAYLOAD)}")
         self.end_headers()
@@ -72,6 +105,8 @@ class FuseIntegrationTest(unittest.TestCase):
         cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         cls.server.request_lock = threading.Lock()
         cls.server.flaky_attempts = 0
+        cls.server.changed_requests = 0
+        cls.server.interrupted_requests = 0
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         cls.tmp = tempfile.TemporaryDirectory(prefix="curlhttpfs-test-")
@@ -196,6 +231,30 @@ class FuseIntegrationTest(unittest.TestCase):
                 self.assertEqual(f.read(256), PAYLOAD[:256])
         with self.server.request_lock:
             self.assertGreaterEqual(self.server.flaky_attempts, 2)
+
+    def test_empty_file(self):
+        with self.temporary_mount("empty") as path:
+            self.assertEqual(path.stat().st_size, 0)
+            with open(path, "rb", buffering=0) as f:
+                self.assertEqual(f.read(32), b"")
+
+    def test_etag_change_is_rejected(self):
+        with self.server.request_lock:
+            self.server.changed_requests = 0
+        with self.temporary_mount("changed") as path:
+            self.assertEqual(path.stat().st_size, len(PAYLOAD))
+            with self.assertRaises(OSError):
+                with open(path, "rb", buffering=0) as f:
+                    f.read(64)
+
+    def test_recover_interrupted_transfer(self):
+        with self.server.request_lock:
+            self.server.interrupted_requests = 0
+        with self.temporary_mount("interrupted") as path:
+            with open(path, "rb", buffering=0) as f:
+                self.assertEqual(f.read(512), PAYLOAD[:512])
+        with self.server.request_lock:
+            self.assertGreaterEqual(self.server.interrupted_requests, 3)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
