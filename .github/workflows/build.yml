@@ -22,7 +22,7 @@ jobs:
       - name: Smoke test
         run: |
           test -x curlhttpfs
-          ./curlhttpfs --help >/dev/null
+          ./curlhttpfs -o url=https://example.com/test.bin --help >/dev/null
       - name: Clean rebuild
         run: |
           make clean
