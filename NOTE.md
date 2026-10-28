@@ -101,3 +101,20 @@ Both tests run automatically under the existing Linux Actions workflow; no new C
 - [ ] macOS/Windows adapter builds and integration tests after those ports exist.
 
 Do not mark any backlog item done merely because the current basic read tests pass.
+
+## HTTP read reliability milestone (2026-10-29)
+
+Implemented in `curlhttpfs.c`:
+- HTTP byte-range capability/size probe using `GET Range: bytes=0-0`, requiring HTTP 206 with valid `Content-Range`; unsupported servers fail explicitly.
+- Full read validation: matching `Content-Range` start/end/total, HTTP 206, and exact response length; reject incorrect or truncated replies rather than returning unverified bytes.
+- Connection timeout 5 seconds, total per-request timeout 15 seconds; up to 3 attempts on connection/transfer timeouts and transient HTTP 429/500/502/503/504; exponential backoff (100 ms, 200 ms). Persistent protocol errors do not retry.
+- No transparent persistence/cache has been added. libcurl default TLS verification remains enabled.
+- Tests added: malformed `Content-Range` rejection, transient HTTP 503 recovery. These use a local fixture and real FUSE mount.
+
+Known limitations/follow-up:
+- [ ] Document configurable timeout/retry options instead of hardcoded defaults.
+- [ ] Test socket resets, hanging connections and partial responses.
+- [ ] Strengthen `Content-Range` parsing and rejection of duplicate conflicting headers; account for representation changes and ETag/If-Range.
+- [ ] Add empty-file handling (a zero-byte object cannot satisfy `bytes=0-0` with 206).
+- [ ] Audit metadata concurrency, FUSE error mapping and integer/size bounds.
+- [ ] Verify this milestone's new tests on both Linux CI runners; do not infer pass status from prior commits.
