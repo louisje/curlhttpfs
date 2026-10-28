@@ -1,14 +1,24 @@
-URL="http://cds.sun.com/is-bin/INTERSHOP.enfinity/WFS/CDS-CDS_Developer-Site/en_US/-/USD/VerifyItem-Start/java_ee_sdk-6u2-unix-ml.sh?BundledLineItemUUID=DqiJ_hCy3.YAAAEv0iQIRwRz&OrderID=DU.J_hCyakoAAAEvwCQIRwRz&ProductID=ZdyJ_hCyVuAAAAEurb8Hek4c&FileName=/java_ee_sdk-6u2-unix-ml.sh"
-FILENAME="java_ee_sdk-6u2-unix-ml.sh"
+CC ?= cc
+PKG_CONFIG ?= pkg-config
+CFLAGS ?= -O2 -g
+CPPFLAGS ?=
+LDFLAGS ?=
+LDLIBS ?=
 
-curlhttpfs: curlhttpfs.c
-	gcc -Wall -I/usr/include/fuse/ -D_FILE_OFFSET_BITS=64 curlhttpfs.c -o curlhttpfs -lcurl -lpthread -lfuse
+FUSE_CFLAGS := $(shell $(PKG_CONFIG) --cflags fuse3)
+FUSE_LIBS := $(shell $(PKG_CONFIG) --libs fuse3)
+CURL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libcurl)
+CURL_LIBS := $(shell $(PKG_CONFIG) --libs libcurl)
 
-clean: umount
-	trash curlhttpfs
+.PHONY: all clean check-deps
+all: curlhttpfs
 
-mount: curlhttpfs umount
-	./curlhttpfs -o url=${URL},filename=${FILENAME},allow_root remote/
+check-deps:
+	@$(PKG_CONFIG) --exists fuse3 || { echo "Missing dependency: fuse3 development files" >&2; exit 1; }
+	@$(PKG_CONFIG) --exists libcurl || { echo "Missing dependency: libcurl development files" >&2; exit 1; }
 
-umount:
-	-fusermount -uz remote/
+curlhttpfs: curlhttpfs.c | check-deps
+	$(CC) $(CPPFLAGS) $(CFLAGS) -Wall -Wextra -D_FILE_OFFSET_BITS=64 $(FUSE_CFLAGS) $(CURL_CFLAGS) $< -o $@ $(LDFLAGS) $(FUSE_LIBS) $(CURL_LIBS) $(LDLIBS)
+
+clean:
+	rm -f curlhttpfs
