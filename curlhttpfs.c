@@ -8,7 +8,7 @@
   gcc -Wall `pkg-config fuse --cflags --libs` hello.c -o hello
 */
 
-#define FUSE_USE_VERSION 26
+#define FUSE_USE_VERSION 31
 
 #include <fuse.h>
 #include <fuse_opt.h>
@@ -41,7 +41,7 @@ size_t my_write_callback(void *ptr, size_t size, size_t nmemb, void *stream);
 
 struct httpfs_file {
 	char filename[512];
-	double size;
+	curl_off_t size;
 	long filetime;
 } httpfs_file = {
 	"/",
@@ -50,12 +50,14 @@ struct httpfs_file {
 
 typedef struct httpfs_buffer {
 	char *p;
-	long len;
+	size_t len;
+	size_t capacity;
 } httpfs_buffer_t;
 
-static int httpfs_getattr(const char *path, struct stat *stbuf)
+static int httpfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi)
 {
 	int res = 0;
+	(void) fi;
 	CURL *curl;
 	CURLcode code;
 
@@ -72,19 +74,20 @@ static int httpfs_getattr(const char *path, struct stat *stbuf)
 		curl_easy_setopt(curl, CURLOPT_FILETIME, 1);
 		curl_easy_setopt(curl, CURLOPT_NOBODY, 1);
 		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
-		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0);
-		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0);
+		/* Use libcurl default TLS verification. */
+		
 		code = curl_easy_perform(curl);
 		if (code != CURLE_OK)
 		{
-			return -ENOENT;
+			curl_easy_cleanup(curl);
+			return -EIO;
 		}
 		code = curl_easy_getinfo(curl, CURLINFO_FILETIME, &httpfs_file.filetime);
 		if (code == CURLE_OK)
 		{
 			stbuf->st_mtime = (time_t)httpfs_file.filetime;
 		}
-		code = curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &httpfs_file.size);
+		code = curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &httpfs_file.size);
 		if (code == CURLE_OK)
 		{
 			stbuf->st_size = (off_t)httpfs_file.size;
@@ -99,17 +102,19 @@ static int httpfs_getattr(const char *path, struct stat *stbuf)
 }
 
 static int httpfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
-			 off_t offset, struct fuse_file_info *fi)
+			 off_t offset, struct fuse_file_info *fi,
+			 enum fuse_readdir_flags flags)
 {
+	(void) flags;
 	(void) offset;
 	(void) fi;
 
 	if (strcmp(path, "/") != 0)
 		return -ENOENT;
 
-	filler(buf, ".", NULL, 0);
-	filler(buf, "..", NULL, 0);
-	filler(buf, httpfs_file.filename + 1, NULL, 0);
+	filler(buf, ".", NULL, 0, 0);
+	filler(buf, "..", NULL, 0, 0);
+	filler(buf, httpfs_file.filename + 1, NULL, 0, 0);
 
 	return 0;
 }
@@ -120,20 +125,18 @@ static int httpfs_open(const char *path, struct fuse_file_info *fi)
 	{
 		return -ENOENT;
 	}
-	/*
-	if ((fi->flags & 3) != O_RDONLY)
-	{
+	if ((fi->flags & O_ACCMODE) != O_RDONLY)
 		return -EACCES;
-	}
-	*/
 	return 0;
 }
 
 size_t my_write_callback(void *ptr, size_t size, size_t nmemb, void *stream)
 {
-	int total_size = size * nmemb;
+	size_t total_size = size * nmemb;
 	struct httpfs_buffer *httpfs_buf = (struct httpfs_buffer *)stream;
 
+	if (total_size > httpfs_buf->capacity - httpfs_buf->len)
+		return 0;
 	memcpy(httpfs_buf->p + httpfs_buf->len, ptr, total_size);
 	httpfs_buf->len += total_size;
 
@@ -157,8 +160,8 @@ long read_curl_buffer(size_t size, off_t offset, httpfs_buffer_t *httpfs_buf)
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, my_write_callback);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, httpfs_buf);
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0);
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0);
+	/* Use libcurl default TLS verification. */
+	
 	curl_easy_setopt(curl, CURLOPT_RANGE, range);
 	if (curl_easy_perform(curl) != CURLE_OK)
 	{
@@ -185,18 +188,19 @@ static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
 		return -ENOENT;
 	}
 
-	if (!httpfs_file.size) // Qoo
+	if (!httpfs_file.size) // Metadata not yet available
 	{
 		curl = curl_easy_init();
 		curl_easy_setopt(curl, CURLOPT_URL, options.target_url);
 		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
-		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0);
-		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0);
+		/* Use libcurl default TLS verification. */
+		
 		curl_easy_setopt(curl, CURLOPT_NOBODY, 1);
 		code = curl_easy_perform(curl);
 		if (code != CURLE_OK)
 		{
-			return -ENOENT;
+			curl_easy_cleanup(curl);
+			return -EIO;
 		}
 		code = curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &httpfs_file.size);
 		if (code != CURLE_OK)
@@ -211,21 +215,23 @@ static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
 		return 0;
 	}
 
-	if (offset + size > httpfs_file.size)
+	if (size > (size_t)(httpfs_file.size - offset))
 	{
 		size = httpfs_file.size - offset;
 	}
 
 	httpfs_buf.p = buf;
 	httpfs_buf.len = 0;
+	httpfs_buf.capacity = size;
 
-	if (read_curl_buffer(size, offset, &httpfs_buf) < 0)
+	long received = read_curl_buffer(size, offset, &httpfs_buf);
+	if (received < 0)
 	{
 		return -ENOENT;
 	}
 	else
 	{
-		return size;
+		return (int)received;
 	}
 }
 
@@ -256,7 +262,7 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	if (strlen(options.target_url) > 512)
+	if (strlen(options.target_url) >= sizeof(temp_url))
 	{
 		fprintf(stderr, "ERROR: Target URL is too long!\n");
 		return -1;
@@ -270,11 +276,13 @@ int main(int argc, char *argv[])
 		{
 			*str = '\0';
 		}
-		strcat(httpfs_file.filename, basename(temp_url));
+		if (snprintf(httpfs_file.filename, sizeof(httpfs_file.filename), "/%s", basename(temp_url)) >= (int)sizeof(httpfs_file.filename))
+		return 1;
 	}
 	else
 	{
-		strcat(httpfs_file.filename, options.target_filename);
+		if (snprintf(httpfs_file.filename, sizeof(httpfs_file.filename), "/%s", options.target_filename) >= (int)sizeof(httpfs_file.filename))
+		return 1;
 	}
 
 	if (fuse_main(args.argc, args.argv, &httpfs_oper, NULL))
