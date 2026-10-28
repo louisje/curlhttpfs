@@ -16,7 +16,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libfuse3-dev libcurl4-openssl-dev
+          sudo apt-get install -y build-essential pkg-config fuse3 libfuse3-dev libcurl4-openssl-dev
       - name: Build
         run: make
       - name: Smoke test
@@ -27,3 +27,9 @@ jobs:
         run: |
           make clean
           make
+      - name: Check FUSE device
+        run: |
+          ls -l /dev/fuse
+          test -c /dev/fuse
+      - name: HTTP Range + mounted filesystem tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
