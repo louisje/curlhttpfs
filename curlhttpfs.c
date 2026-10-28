@@ -27,6 +27,7 @@
 #include <limits.h>
 #include <strings.h>
 #include <unistd.h>
+#include <ctype.h>
 
 struct options {
 	char *target_url;
@@ -48,6 +49,7 @@ struct httpfs_file {
 	curl_off_t size;
 	long filetime;
 	int metadata_valid;
+	char etag[256];
 } httpfs_file = {
 	"/",
 	0,
@@ -95,6 +97,7 @@ static size_t probe_body(void *ptr, size_t size, size_t count, void *unused)
 
 typedef struct response_headers {
 	int seen;
+	char etag[256];
 	unsigned long long start, end, total;
 } response_headers_t;
 
@@ -104,6 +107,19 @@ static size_t parse_range_header(char *line, size_t size, size_t count, void *us
 	size_t n = size * count;
 	unsigned long long a, b, c;
 	char extra;
+	if (n >= 5 && strncmp(line, "HTTP/", 5) == 0) {
+		headers->seen = 0;
+		headers->etag[0] = '\0';
+	}
+	if (n >= 5 && strncasecmp(line, "ETag:", 5) == 0) {
+		size_t begin = 5, end = n;
+		while (begin < end && isspace((unsigned char)line[begin])) ++begin;
+		while (end > begin && isspace((unsigned char)line[end - 1])) --end;
+		if (end > begin && end - begin < sizeof(headers->etag)) {
+			memcpy(headers->etag, line + begin, end - begin);
+			headers->etag[end - begin] = '\0';
+		}
+	}
 	if (n >= 14 && strncasecmp(line, "Content-Range:", 14) == 0) {
 		if (sscanf(line + 14, " bytes %llu-%llu/%llu %c", &a, &b, &c, &extra) == 3) {
 			headers->seen = 1;
@@ -112,9 +128,6 @@ static size_t parse_range_header(char *line, size_t size, size_t count, void *us
 			headers->seen = -1;
 		}
 	}
-	/* Redirects contain separate header blocks. */
-	if (n >= 5 && strncmp(line, "HTTP/", 5) == 0)
-		headers->seen = 0;
 	return n;
 }
 
@@ -139,8 +152,29 @@ static int fetch_metadata(void)
 		    headers.start == 0 && headers.end == 0 && headers.total > 0 &&
 		    headers.total <= (unsigned long long)LLONG_MAX) {
 			httpfs_file.size = (curl_off_t)headers.total;
+			strcpy(httpfs_file.etag, headers.etag);
 			httpfs_file.metadata_valid = 1;
 			return 0;
+		}
+		if (code == CURLE_OK && status == 416 && headers.seen != 1) {
+			/* Verify a zero-byte resource using HEAD rather than trusting 416 alone. */
+			CURL *head = curl_easy_init();
+			if (!head) return -ENOMEM;
+			configure_curl(head);
+			curl_easy_setopt(head, CURLOPT_NOBODY, 1L);
+			CURLcode head_code = curl_easy_perform(head);
+			long head_status = 0;
+			curl_off_t length = -1;
+			if (head_code == CURLE_OK) {
+				curl_easy_getinfo(head, CURLINFO_RESPONSE_CODE, &head_status);
+				curl_easy_getinfo(head, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &length);
+			}
+			curl_easy_cleanup(head);
+			if (head_code == CURLE_OK && head_status == 200 && length == 0) {
+				httpfs_file.size = 0;
+				httpfs_file.metadata_valid = 1;
+				return 0;
+			}
 		}
 		if (!retryable(code, status)) return -EIO;
 		if (attempt + 1 < HTTP_RETRIES) usleep((useconds_t)(100000U << attempt));
@@ -229,10 +263,20 @@ static int read_curl_buffer(size_t size, off_t offset, httpfs_buffer_t *buffer)
 		curl_easy_setopt(curl, CURLOPT_WRITEDATA, buffer);
 		curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, parse_range_header);
 		curl_easy_setopt(curl, CURLOPT_HEADERDATA, &headers);
+		struct curl_slist *conditions = NULL;
+		if (httpfs_file.etag[0]) {
+			char conditional[sizeof(httpfs_file.etag) + 16];
+			snprintf(conditional, sizeof(conditional), "If-Match: %s", httpfs_file.etag);
+			conditions = curl_slist_append(NULL, conditional);
+			curl_easy_setopt(curl, CURLOPT_HTTPHEADER, conditions);
+		}
 		code = curl_easy_perform(curl);
 		if (code == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+		curl_slist_free_all(conditions);
 		curl_easy_cleanup(curl);
+		if (status == 412) return -ESTALE;
 		if (code == CURLE_OK && status == 206 && headers.seen == 1 &&
+		    (!httpfs_file.etag[0] || (headers.etag[0] && strcmp(headers.etag, httpfs_file.etag) == 0)) &&
 		    headers.start == start && headers.end == end &&
 		    headers.total == (unsigned long long)httpfs_file.size &&
 		    buffer->len == size)
