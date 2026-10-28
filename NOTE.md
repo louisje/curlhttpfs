@@ -55,3 +55,21 @@ curlhttpfs is intended to mount a remote large HTTP(S) file as a **read-only, on
 4. Add regression tests and CI, then revisit deferred features.
 
 No code or build files were changed during this audit.
+
+## Cross-platform porting roadmap (Linux, macOS, Windows)
+
+**Target:** support all three desktop platforms while keeping one shared C-based HTTP Range / metadata / caching core. Platform-specific filesystem adapters should be thin and isolated. This is a **roadmap, not a claim of current support**.
+
+- [ ] **Linux:** use libfuse 3 as the primary filesystem adapter. Verify builds, read-only mounts, random reads, error handling, and mount/unmount on supported distributions.
+- [ ] **macOS:** investigate macFUSE's supported API and installation requirements; do not assume Linux libfuse 3 headers or binaries are directly portable. Implement compatibility glue or a dedicated adapter where required; validate on both Intel and Apple Silicon.
+- [ ] **Windows:** implement a WinFsp-based adapter (or evaluate its FUSE compatibility layer first), using native Windows path conventions, mount semantics and error mappings. Do not assume Unix FUSE or Autotools is sufficient for Windows.
+- [ ] **Shared core:** separate URL parsing, libcurl sessions, HTTP metadata / range reads and buffering from FUSE/WinFsp callbacks. Keep filesystem semantics read-only on every platform.
+- [ ] **Build systems:** retain the user's desired Autotools path for Unix-like platforms, but evaluate a Windows-friendly build configuration (potentially CMake or Meson) for the WinFsp target. Avoid replacing the existing build workflow until a tested migration plan exists.
+- [ ] **CI:** gradually extend build-only GitHub Actions coverage from Linux to `macos-latest` and `windows-latest`, installing platform dependencies as needed. Add actual mounted-filesystem integration tests only where runner permissions/drivers allow; distinguish build success from mount success.
+- [ ] **Compatibility:** define tested minimum OS/driver/library versions, and document macFUSE/WinFsp installation and privileges. Do not promise completely driverless mounting.
+
+**Order:** finish a green Linux build and basic regression tests; isolate shared core; bring up macOS; add Windows; validate each platform independently. New caching and performance features remain deferred.
+
+## Audit status update (2026-10-28)
+
+Since the original inventory above, commits have begun adapting the code to FUSE 3 and modern libcurl, have replaced the hardcoded Makefile dependencies with pkg-config, and added a Linux GitHub Actions build workflow for Ubuntu 22.04/24.04. These are initial changes only; CI success and runtime mount behavior are **not yet confirmed**. The unchecked findings above remain open until separately verified; historical observations describe the original source snapshot.
