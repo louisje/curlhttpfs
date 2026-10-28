@@ -23,6 +23,10 @@
 #include <stddef.h>
 #include <libgen.h>
 #include <pthread.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <strings.h>
+#include <unistd.h>
 
 struct options {
 	char *target_url;
@@ -43,8 +47,10 @@ struct httpfs_file {
 	char filename[512];
 	curl_off_t size;
 	long filetime;
+	int metadata_valid;
 } httpfs_file = {
 	"/",
+	0,
 	0,
 	0
 };
@@ -55,49 +61,110 @@ typedef struct httpfs_buffer {
 	size_t capacity;
 } httpfs_buffer_t;
 
+/* HTTP requests have bounded duration and only transient failures are retried. */
+#define HTTP_TIMEOUT_MS 15000L
+#define HTTP_CONNECT_TIMEOUT_MS 5000L
+#define HTTP_RETRIES 3
+
+static void configure_curl(CURL *curl)
+{
+	curl_easy_setopt(curl, CURLOPT_URL, options.target_url);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, HTTP_CONNECT_TIMEOUT_MS);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, HTTP_TIMEOUT_MS);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "identity");
+}
+
+static int retryable(CURLcode result, long status)
+{
+	if (result == CURLE_OPERATION_TIMEDOUT || result == CURLE_COULDNT_CONNECT ||
+	    result == CURLE_RECV_ERROR || result == CURLE_SEND_ERROR ||
+	    result == CURLE_PARTIAL_FILE)
+		return 1;
+	return result == CURLE_OK && (status == 429 || status == 500 ||
+	                             status == 502 || status == 503 || status == 504);
+}
+
+/* A range probe works even when HEAD/Accept-Ranges is unsupported or misleading. */
+static size_t probe_body(void *ptr, size_t size, size_t count, void *unused)
+{
+	(void)ptr; (void)unused;
+	return size * count;
+}
+
+typedef struct response_headers {
+	int seen;
+	unsigned long long start, end, total;
+} response_headers_t;
+
+static size_t parse_range_header(char *line, size_t size, size_t count, void *userdata)
+{
+	response_headers_t *headers = userdata;
+	size_t n = size * count;
+	unsigned long long a, b, c;
+	char extra;
+	if (n >= 14 && strncasecmp(line, "Content-Range:", 14) == 0) {
+		if (sscanf(line + 14, " bytes %llu-%llu/%llu %c", &a, &b, &c, &extra) == 3) {
+			headers->seen = 1;
+			headers->start = a; headers->end = b; headers->total = c;
+		} else {
+			headers->seen = -1;
+		}
+	}
+	/* Redirects contain separate header blocks. */
+	if (n >= 5 && strncmp(line, "HTTP/", 5) == 0)
+		headers->seen = 0;
+	return n;
+}
+
+static int fetch_metadata(void)
+{
+	for (int attempt = 0; attempt < HTTP_RETRIES; ++attempt) {
+		CURL *curl = curl_easy_init();
+		CURLcode code;
+		long status = 0;
+		response_headers_t headers = {0};
+		if (!curl) return -ENOMEM;
+		configure_curl(curl);
+		curl_easy_setopt(curl, CURLOPT_RANGE, "0-0");
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, probe_body);
+		curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, parse_range_header);
+		curl_easy_setopt(curl, CURLOPT_HEADERDATA, &headers);
+		curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)1);
+		code = curl_easy_perform(curl);
+		if (code == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+		curl_easy_cleanup(curl);
+		if (code == CURLE_OK && status == 206 && headers.seen == 1 &&
+		    headers.start == 0 && headers.end == 0 && headers.total > 0 &&
+		    headers.total <= (unsigned long long)LLONG_MAX) {
+			httpfs_file.size = (curl_off_t)headers.total;
+			httpfs_file.metadata_valid = 1;
+			return 0;
+		}
+		if (!retryable(code, status)) return -EIO;
+		if (attempt + 1 < HTTP_RETRIES) usleep((useconds_t)(100000U << attempt));
+	}
+	return -EIO;
+}
+
 static int httpfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi)
 {
-	(void) fi;
-	CURL *curl;
-	CURLcode code;
-
-	memset(stbuf, 0, sizeof(struct stat));
+	(void)fi;
+	memset(stbuf, 0, sizeof(*stbuf));
 	if (strcmp(path, "/") == 0) {
 		stbuf->st_mode = S_IFDIR | 0755;
 		stbuf->st_nlink = 2;
-	} else if (strcmp(path, httpfs_file.filename) == 0) {
-		stbuf->st_mode = S_IFREG | 0555;
-		stbuf->st_nlink = 1;
-
-		curl = curl_easy_init();
-		curl_easy_setopt(curl, CURLOPT_URL, options.target_url);
-		curl_easy_setopt(curl, CURLOPT_FILETIME, 1);
-		curl_easy_setopt(curl, CURLOPT_NOBODY, 1);
-		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
-		/* Use libcurl default TLS verification. */
-		
-		code = curl_easy_perform(curl);
-		if (code != CURLE_OK)
-		{
-			curl_easy_cleanup(curl);
-			return -EIO;
-		}
-		code = curl_easy_getinfo(curl, CURLINFO_FILETIME, &httpfs_file.filetime);
-		if (code == CURLE_OK)
-		{
-			stbuf->st_mtime = (time_t)httpfs_file.filetime;
-		}
-		code = curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &httpfs_file.size);
-		if (code == CURLE_OK)
-		{
-			stbuf->st_size = (off_t)httpfs_file.size;
-		}
-		curl_easy_cleanup(curl);
+		return 0;
 	}
-	else
-	{
-		return -ENOENT;
+	if (strcmp(path, httpfs_file.filename)) return -ENOENT;
+	if (!httpfs_file.metadata_valid) {
+		int result = fetch_metadata();
+		if (result != 0) return result;
 	}
+	stbuf->st_mode = S_IFREG | 0444;
+	stbuf->st_nlink = 1;
+	stbuf->st_size = (off_t)httpfs_file.size;
 	return 0;
 }
 
@@ -143,100 +210,55 @@ size_t my_write_callback(void *ptr, size_t size, size_t nmemb, void *stream)
 	return total_size;
 }
 
-long read_curl_buffer(size_t size, off_t offset, httpfs_buffer_t *httpfs_buf)
+static int read_curl_buffer(size_t size, off_t offset, httpfs_buffer_t *buffer)
 {
 	char range[100];
-	long res;
-	long status = 0;
-	CURL *curl = NULL;
-
-	sprintf(range, "%llu-%llu", (unsigned long long)offset, (unsigned long long)offset + (unsigned long long)size - 1);
-
-	curl = curl_easy_init();
-	if (!curl)
-	{
-		return -1;
+	unsigned long long start = (unsigned long long)offset;
+	unsigned long long end = start + size - 1;
+	snprintf(range, sizeof(range), "%llu-%llu", start, end);
+	for (int attempt = 0; attempt < HTTP_RETRIES; ++attempt) {
+		CURL *curl = curl_easy_init();
+		CURLcode code;
+		long status = 0;
+		response_headers_t headers = {0};
+		if (!curl) return -ENOMEM;
+		buffer->len = 0;
+		configure_curl(curl);
+		curl_easy_setopt(curl, CURLOPT_RANGE, range);
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, my_write_callback);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, buffer);
+		curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, parse_range_header);
+		curl_easy_setopt(curl, CURLOPT_HEADERDATA, &headers);
+		code = curl_easy_perform(curl);
+		if (code == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+		curl_easy_cleanup(curl);
+		if (code == CURLE_OK && status == 206 && headers.seen == 1 &&
+		    headers.start == start && headers.end == end &&
+		    headers.total == (unsigned long long)httpfs_file.size &&
+		    buffer->len == size)
+			return (int)buffer->len;
+		if (!retryable(code, status)) return -EIO;
+		if (attempt + 1 < HTTP_RETRIES) usleep((useconds_t)(100000U << attempt));
 	}
-	curl_easy_setopt(curl, CURLOPT_URL, options.target_url);
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, my_write_callback);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, httpfs_buf);
-	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
-	/* Use libcurl default TLS verification. */
-	
-	curl_easy_setopt(curl, CURLOPT_RANGE, range);
-	if (curl_easy_perform(curl) != CURLE_OK ||
-	    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status) != CURLE_OK ||
-	    status != 206)
-	{
-		res = -1;
-	}
-	else
-	{
-		res = (long)httpfs_buf->len;
-	}
-	curl_easy_cleanup(curl);
-	return res;
+	return -EIO;
 }
 
 static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
-		      struct fuse_file_info *fi)
+                      struct fuse_file_info *fi)
 {
-	(void) fi;
-	CURL *curl;
-	CURLcode code;
-	struct httpfs_buffer httpfs_buf;
-
-	if(strcmp(path, httpfs_file.filename) != 0)
-	{
-		return -ENOENT;
+	(void)fi;
+	if (strcmp(path, httpfs_file.filename)) return -ENOENT;
+	if (offset < 0) return -EINVAL;
+	if (!httpfs_file.metadata_valid) {
+		int result = fetch_metadata();
+		if (result != 0) return result;
 	}
-
-	if (!httpfs_file.size) // Metadata not yet available
-	{
-		curl = curl_easy_init();
-		curl_easy_setopt(curl, CURLOPT_URL, options.target_url);
-		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
-		/* Use libcurl default TLS verification. */
-		
-		curl_easy_setopt(curl, CURLOPT_NOBODY, 1);
-		code = curl_easy_perform(curl);
-		if (code != CURLE_OK)
-		{
-			curl_easy_cleanup(curl);
-			return -EIO;
-		}
-		code = curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &httpfs_file.size);
-		if (code != CURLE_OK)
-		{
-			curl_easy_cleanup(curl);
-			return -EIO;
-		}
-		curl_easy_cleanup(curl);
-	}
-
-	if (size == 0 || offset >= httpfs_file.size)
-	{
-		return 0;
-	}
-
-	if (size > (size_t)(httpfs_file.size - offset))
-	{
-		size = httpfs_file.size - offset;
-	}
-
-	httpfs_buf.p = buf;
-	httpfs_buf.len = 0;
-	httpfs_buf.capacity = size;
-
-	long received = read_curl_buffer(size, offset, &httpfs_buf);
-	if (received < 0)
-	{
-		return -ENOENT;
-	}
-	else
-	{
-		return (int)received;
-	}
+	if (size == 0 || (curl_off_t)offset >= httpfs_file.size) return 0;
+	if ((curl_off_t)size > httpfs_file.size - (curl_off_t)offset)
+		size = (size_t)(httpfs_file.size - (curl_off_t)offset);
+	if (size > INT_MAX) size = INT_MAX;
+	httpfs_buffer_t buffer = {buf, 0, size};
+	return read_curl_buffer(size, offset, &buffer);
 }
 
 static struct fuse_operations httpfs_oper = {
