@@ -625,7 +625,7 @@ static void schedule_prefetch(unsigned long long next, unsigned int depth)
 	if (next >= ((unsigned long long)httpfs_file.size + CACHE_BLOCK_SIZE - 1) / CACHE_BLOCK_SIZE)
 		return;
 	pthread_mutex_lock(&prefetch_lock);
-	if (prefetch_started && !prefetch_shutdown && !prefetch_pending && !prefetch_busy) {
+	if (prefetch_started && !prefetch_shutdown) {
 		prefetch_block = next;
 		prefetch_depth = depth;
 		prefetch_pending = 1;
