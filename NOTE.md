@@ -270,3 +270,10 @@ Remaining work:
 - Migrate the maintained build entry point to `configure.ac` and `Makefile.am` using autoconf/automake and pkg-config checks for FUSE3, libcurl, and OpenSSL, plus POSIX pthread support.
 - Validate `autoreconf -fi && ./configure && make && make check && make install DESTDIR=...` on the CI Linux matrix. Keep the runtime FUSE integration suite and benchmark scripts.
 - Autotools portability does **not** imply that FUSE3, `flock`, `O_NOFOLLOW`, and Linux-specific runtime assumptions are immediately portable to every OS. Check capabilities explicitly and report unsupported targets.
+
+### Autotools implementation
+
+- Added `configure.ac` (Autoconf/Automake setup and pkg-config dependency checks), `Makefile.am` (build, install, distribution and `make check` target), `.gitignore` for generated files and `README.md` with build/install instructions.
+- Removed the previous tracked hand-written `Makefile`; the supported build now begins with `autoreconf -fi && ./configure`, which generates `Makefile`.
+- GitHub Actions installs Autotools prerequisites, bootstraps and configures, builds, smoke-tests, performs a clean rebuild, executes `make check`, validates staged installation under `DESTDIR`, and retains existing FUSE integration tests and benchmark artifacts.
+- Build portability is restricted by available FUSE3/libcurl/OpenSSL headers and POSIX runtime dependencies. Linux Ubuntu 22.04/24.04 are tested; macOS/Windows are not claimed supported by this migration alone.
