@@ -28,7 +28,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.respond(head_only=False)
 
     def respond(self, head_only):
-        if self.path not in ("/test.bin", "/bad.bin", "/flaky.bin", "/empty.bin", "/changed.bin", "/interrupted.bin"):
+        if self.path not in ("/test.bin", "/bad.bin", "/flaky.bin", "/empty.bin", "/changed.bin", "/interrupted.bin", "/cache.bin"):
             self.send_error(404)
             return
         if self.path == "/empty.bin":
@@ -85,10 +85,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 self.close_connection = True
                 return
+        if self.path == "/cache.bin" and requested:
+            with self.server.request_lock:
+                self.server.cache_requests += 1
         self.send_response(206 if requested else 200)
         self.send_header("Content-Length", str(end - start + 1))
         self.send_header("Accept-Ranges", "bytes")
-        if self.path == "/changed.bin":
+        if self.path in ("/changed.bin", "/cache.bin"):
             self.send_header("ETag", '"v1"')
         if requested:
             self.send_header("Content-Range", f"bytes {start + (1 if self.path == '/bad.bin' else 0)}-{end}/{len(PAYLOAD)}")
@@ -107,6 +110,7 @@ class FuseIntegrationTest(unittest.TestCase):
         cls.server.flaky_attempts = 0
         cls.server.changed_requests = 0
         cls.server.interrupted_requests = 0
+        cls.server.cache_requests = 0
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         cls.tmp = tempfile.TemporaryDirectory(prefix="curlhttpfs-test-")
@@ -189,13 +193,16 @@ class FuseIntegrationTest(unittest.TestCase):
             self.assertEqual(data, PAYLOAD[start:start + 4096])
 
     @contextlib.contextmanager
-    def temporary_mount(self, name):
+    def temporary_mount(self, name, cache_dir=None):
         mount = Path(self.tmp.name) / name
         mount.mkdir()
         port = self.server.server_address[1]
+        opts = f"url=http://127.0.0.1:{port}/{name}.bin,filename=remote.bin"
+        if cache_dir is not None:
+            opts += f",cache_dir={cache_dir}"
         proc = subprocess.Popen(
             [str(Path("curlhttpfs").resolve()), "-f", "-s",
-             "-o", f"url=http://127.0.0.1:{port}/{name}.bin,filename=remote.bin",
+             "-o", opts,
              str(mount)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
             deadline = time.monotonic() + 12
@@ -255,6 +262,24 @@ class FuseIntegrationTest(unittest.TestCase):
                 self.assertEqual(f.read(512), PAYLOAD[:512])
         with self.server.request_lock:
             self.assertGreaterEqual(self.server.interrupted_requests, 3)
+
+    def test_persistent_block_cache_after_remount(self):
+        cache_dir = Path(self.tmp.name) / "cache-files"
+        with self.server.request_lock:
+            self.server.cache_requests = 0
+        with self.temporary_mount("cache", cache_dir=cache_dir) as path:
+            with open(path, "rb", buffering=0) as f:
+                f.seek(13)
+                self.assertEqual(f.read(100), PAYLOAD[13:113])
+        with self.server.request_lock:
+            first_requests = self.server.cache_requests
+        self.assertGreaterEqual(first_requests, 2)  # range probe and first full block
+        with self.temporary_mount("cache", cache_dir=cache_dir) as path:
+            with open(path, "rb", buffering=0) as f:
+                f.seek(13)
+                self.assertEqual(f.read(100), PAYLOAD[13:113])
+        with self.server.request_lock:
+            self.assertEqual(self.server.cache_requests, first_requests + 1)  # probe only
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
