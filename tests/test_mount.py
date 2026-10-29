@@ -28,7 +28,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.respond(head_only=False)
 
     def respond(self, head_only):
-        if self.path not in ("/test.bin", "/bad.bin", "/flaky.bin", "/empty.bin", "/changed.bin", "/interrupted.bin", "/cache.bin", "/cache2.bin"):
+        if self.path not in ("/test.bin", "/bad.bin", "/flaky.bin", "/empty.bin", "/changed.bin", "/interrupted.bin", "/cache.bin", "/cache2.bin", "/slowcache.bin"):
             self.send_error(404)
             return
         if self.path == "/empty.bin":
@@ -85,13 +85,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 self.close_connection = True
                 return
+        if self.path == "/slowcache.bin" and requested:
+            with self.server.request_lock:
+                self.server.slowcache_requests += 1
+                is_probe = start == 0 and end == 0
+            if not is_probe:
+                time.sleep(0.35)
         if self.path == "/cache.bin" and requested:
             with self.server.request_lock:
                 self.server.cache_requests += 1
         self.send_response(206 if requested else 200)
         self.send_header("Content-Length", str(end - start + 1))
         self.send_header("Accept-Ranges", "bytes")
-        if self.path in ("/changed.bin", "/cache.bin", "/cache2.bin"):
+        if self.path in ("/changed.bin", "/cache.bin", "/cache2.bin", "/slowcache.bin"):
             self.send_header("ETag", '"v2"' if self.path == "/cache2.bin" else '"v1"')
         if requested:
             self.send_header("Content-Range", f"bytes {start + (1 if self.path == '/bad.bin' else 0)}-{end}/{len(PAYLOAD)}")
@@ -111,6 +117,7 @@ class FuseIntegrationTest(unittest.TestCase):
         cls.server.changed_requests = 0
         cls.server.interrupted_requests = 0
         cls.server.cache_requests = 0
+        cls.server.slowcache_requests = 0
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         cls.tmp = tempfile.TemporaryDirectory(prefix="curlhttpfs-test-")
@@ -380,6 +387,46 @@ class FuseIntegrationTest(unittest.TestCase):
                 self.assertEqual(results, [PAYLOAD[:128], PAYLOAD[:128]])
         blocks = [p for p in cache_dir.rglob("*") if p.is_file() and re.fullmatch(r'[0-9a-f]{16}', p.name)]
         self.assertLessEqual(len(blocks), 1)
+
+    def test_cross_process_distinct_blocks_are_parallel(self):
+        cache_dir = Path(self.tmp.name) / "slow-parallel-cache"
+        # Two real mount processes using the same URL and cache directory.
+        with self.temporary_mount("slowcache", cache_dir=cache_dir) as first:
+            mount = Path(self.tmp.name) / "slow-second"
+            mount.mkdir()
+            port = self.server.server_address[1]
+            proc = subprocess.Popen([
+                str(Path("curlhttpfs").resolve()), "-f", "-s", "-o",
+                f"url=http://127.0.0.1:{port}/slowcache.bin,filename=remote.bin,cache_dir={cache_dir}",
+                str(mount)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + 10
+                while not os.path.ismount(mount):
+                    if proc.poll() is not None or time.monotonic() > deadline:
+                        self.fail("second FUSE mount unavailable")
+                    time.sleep(0.05)
+                def read_at(path, offset):
+                    with open(path, "rb", buffering=0) as f:
+                        f.seek(offset)
+                        return f.read(128)
+                begin = time.monotonic()
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = [pool.submit(read_at, first, 65536),
+                               pool.submit(read_at, mount / "remote.bin", 131072)]
+                    result = [future.result() for future in futures]
+                elapsed = time.monotonic() - begin
+                self.assertEqual(result, [PAYLOAD[65536:65664], PAYLOAD[131072:131200]])
+                self.assertLess(elapsed, 0.66, "different blocks were serialized")
+            finally:
+                if os.path.ismount(mount):
+                    subprocess.run(["fusermount3", "-u", str(mount)], check=True)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                proc.stderr.close()
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
