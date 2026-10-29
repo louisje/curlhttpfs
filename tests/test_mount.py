@@ -328,7 +328,7 @@ class FuseIntegrationTest(unittest.TestCase):
                 f.seek(65536 + 10)
                 self.assertEqual(f.read(100), PAYLOAD[65546:65646])
             blocks = [p for p in cache_dir.rglob("*")
-                      if p.is_file() and len(p.name) == 16]
+                      if p.is_file() and re.fullmatch(r'[0-9a-f]{16}', p.name)]
             self.assertEqual(len(blocks), 1)
             self.assertEqual(blocks[0].name, "0000000000000001")
         with self.temporary_mount("cache", cache_dir=cache_dir,
@@ -351,7 +351,7 @@ class FuseIntegrationTest(unittest.TestCase):
         namespaces = [p for p in cache_dir.iterdir() if p.is_dir()]
         self.assertEqual(len(namespaces), 2)
         blocks = [p for p in cache_dir.rglob("*")
-                  if p.is_file() and len(p.name) == 16]
+                  if p.is_file() and re.fullmatch(r'[0-9a-f]{16}', p.name)]
         self.assertEqual(len(blocks), 1)
         with self.server.request_lock:
             before = self.server.cache_requests
@@ -378,7 +378,7 @@ class FuseIntegrationTest(unittest.TestCase):
                 with ThreadPoolExecutor(max_workers=2) as pool:
                     results = list(pool.map(read_path, [one, two]))
                 self.assertEqual(results, [PAYLOAD[:128], PAYLOAD[:128]])
-        blocks = [p for p in cache_dir.rglob("*") if p.is_file() and len(p.name) == 16]
+        blocks = [p for p in cache_dir.rglob("*") if p.is_file() and re.fullmatch(r'[0-9a-f]{16}', p.name)]
         self.assertLessEqual(len(blocks), 1)
 
 if __name__ == "__main__":
