@@ -312,21 +312,26 @@ static void init_cache_locks(void)
 }
 static char cache_namespace[1024];
 static int cache_lock_fd = -1;
+static pthread_mutex_t cache_process_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* The root lock serializes cache readers/writers and global pruning across
  * processes sharing a directory. Other HTTP mounts do not need this lock. */
 static int cache_global_lock(void)
 {
 	if (cache_lock_fd < 0) return -EIO;
+	pthread_mutex_lock(&cache_process_lock);
 	while (flock(cache_lock_fd, LOCK_EX) < 0) {
-		if (errno != EINTR) return -errno;
+		if (errno != EINTR) { int error = -errno; pthread_mutex_unlock(&cache_process_lock); return error; }
 	}
 	return 0;
 }
 
 static void cache_global_unlock(void)
 {
-	if (cache_lock_fd >= 0) flock(cache_lock_fd, LOCK_UN);
+	if (cache_lock_fd >= 0) {
+		flock(cache_lock_fd, LOCK_UN);
+		pthread_mutex_unlock(&cache_process_lock);
+	}
 }
 
 
