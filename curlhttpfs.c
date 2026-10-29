@@ -342,12 +342,12 @@ static int digest_block(const char *data, size_t length, unsigned char digest[32
 	return EVP_Digest(data, length, digest, &n, EVP_sha256(), NULL) == 1 && n == 32;
 }
 
-/* Per-version quota. Count payload and SHA sidecars; temporary files are not
- * included. LRU is approximated with the payload's modification time. */
-static int is_block_name(const char *name)
+/* Global cache quota across all URL/ETag namespaces. Only fixed-format
+ * block files with existing SHA sidecars are considered. */
+static int is_hex_name(const char *name, size_t width)
 {
-	if (strlen(name) != 16) return 0;
-	for (size_t i = 0; i < 16; ++i)
+	if (strlen(name) != width) return 0;
+	for (size_t i = 0; i < width; ++i)
 		if (!isxdigit((unsigned char)name[i])) return 0;
 	return 1;
 }
@@ -361,42 +361,58 @@ static void cache_touch(const char *path)
 	}
 }
 
+/* The quota is best-effort between independent processes. */
 static void cache_prune(unsigned long long protected_block)
 {
-	if (!options.cache_max_bytes || !cache_namespace[0]) return;
+	if (!options.cache_max_bytes || !options.cache_dir || !cache_namespace[0]) return;
 	pthread_mutex_lock(&cache_prune_lock);
 	for (;;) {
-		DIR *dir = opendir(cache_namespace);
-		if (!dir) break;
+		DIR *root = opendir(options.cache_dir);
+		if (!root) break;
 		unsigned long long used = 0, oldest_block = 0;
+		char oldest_dir[1024] = {0};
 		struct timespec oldest = {0};
 		int candidate = 0;
-		struct dirent *entry;
-		while ((entry = readdir(dir)) != NULL) {
-			if (!is_block_name(entry->d_name)) continue;
-			char path[1200], hash_path[1220];
-			struct stat st, hs;
-			if (snprintf(path, sizeof(path), "%s/%s", cache_namespace, entry->d_name) >= (int)sizeof(path) ||
-			    snprintf(hash_path, sizeof(hash_path), "%s.sha256", path) >= (int)sizeof(hash_path) ||
-			    lstat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
-			if (lstat(hash_path, &hs) != 0 || !S_ISREG(hs.st_mode)) continue;
-			used += (unsigned long long)st.st_size + (unsigned long long)hs.st_size;
-			unsigned long long block = strtoull(entry->d_name, NULL, 16);
-			if (block == protected_block) continue;
-			if (!candidate || st.st_mtim.tv_sec < oldest.tv_sec ||
-			    (st.st_mtim.tv_sec == oldest.tv_sec && st.st_mtim.tv_nsec < oldest.tv_nsec)) {
-				candidate = 1;
-				oldest = st.st_mtim;
-				oldest_block = block;
+		struct dirent *ns;
+		while ((ns = readdir(root)) != NULL) {
+			if (!is_hex_name(ns->d_name, 64)) continue;
+			char directory[1024];
+			struct stat ds;
+			if (snprintf(directory, sizeof(directory), "%s/%s", options.cache_dir, ns->d_name) >= (int)sizeof(directory) ||
+			    lstat(directory, &ds) != 0 || !S_ISDIR(ds.st_mode)) continue;
+			DIR *dir = opendir(directory);
+			if (!dir) continue;
+			struct dirent *entry;
+			while ((entry = readdir(dir)) != NULL) {
+				if (!is_hex_name(entry->d_name, 16)) continue;
+				char path[1200], hash_path[1220];
+				struct stat st, hs;
+				if (snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name) >= (int)sizeof(path) ||
+				    snprintf(hash_path, sizeof(hash_path), "%s.sha256", path) >= (int)sizeof(hash_path) ||
+				    lstat(path, &st) != 0 || !S_ISREG(st.st_mode) ||
+				    lstat(hash_path, &hs) != 0 || !S_ISREG(hs.st_mode)) continue;
+				unsigned long long bytes = (unsigned long long)st.st_size + (unsigned long long)hs.st_size;
+				if (ULLONG_MAX - used < bytes) used = ULLONG_MAX;
+				else used += bytes;
+				unsigned long long block = strtoull(entry->d_name, NULL, 16);
+				if (block == protected_block && strcmp(directory, cache_namespace) == 0) continue;
+				if (!candidate || st.st_mtim.tv_sec < oldest.tv_sec ||
+				    (st.st_mtim.tv_sec == oldest.tv_sec && st.st_mtim.tv_nsec < oldest.tv_nsec)) {
+					candidate = 1;
+					oldest = st.st_mtim;
+					oldest_block = block;
+					strcpy(oldest_dir, directory);
+				}
 			}
+			closedir(dir);
 		}
-		closedir(dir);
+		closedir(root);
 		if (used <= options.cache_max_bytes || !candidate) break;
 		pthread_once(&cache_once, init_cache_locks);
 		pthread_mutex_t *lock = &cache_locks[oldest_block % CACHE_LOCK_STRIPES];
 		pthread_mutex_lock(lock);
 		char path[1200], hash_path[1220];
-		if (snprintf(path, sizeof(path), "%s/%016llx", cache_namespace, oldest_block) < (int)sizeof(path) &&
+		if (snprintf(path, sizeof(path), "%s/%016llx", oldest_dir, oldest_block) < (int)sizeof(path) &&
 		    snprintf(hash_path, sizeof(hash_path), "%s.sha256", path) < (int)sizeof(hash_path)) {
 			unlink(path);
 			unlink(hash_path);
