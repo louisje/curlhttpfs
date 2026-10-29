@@ -216,3 +216,11 @@ Remaining work:
 - Added `tests/benchmark_sequential.py`, a standalone reproducible timing tool for an already-mounted file. For meaningful comparisons: use equally sized *fresh* cache directories and the same HTTP source, file, chunk size and read amount for `readahead=0` and `readahead=1`. It reports JSON duration and throughput per run; do not treat unmeasured speedup as established.
 - Example: `python3 tests/benchmark_sequential.py /mnt/http/file.iso --size-mib 16 --chunk-kib 64 --runs 3`.
 - Known tradeoffs: one global worker still serializes HTTP speculative transfers; an active transfer may continue after file close; queue is bounded (busy streams can drop new requests); Linux kernel page caching changes read shapes and warm-cache iterations cannot be compared to cold-cache iterations. Benchmarks have been added but no production throughput conclusion is claimed.
+
+## Bounded parallel HTTP Range prefetch (2026-10-29)
+
+- Added `prefetch_workers=N` with allowed range 1–4 (default 1), effective when `readahead=1` and `cache_dir` are enabled. `--help` documents the option.
+- Replaced the one-thread background prefetch engine with a bounded pthread pool. Each adaptive lookahead depth is split into independently queued 64-KiB block jobs, so multiple workers can issue concurrent HTTP Range requests even for one sequential stream.
+- The existing FIFO, per-stream request coalescing, ETag verification, block-level `flock`, SHA-256 validation, and LRU quota remain in effect; foreground reads are still independent of prefetch success.
+- Added tests that mount with three workers and check that delayed HTTP Range requests overlap in real time, not just that reads eventually succeed.
+- Performance caveat: concurrency is bounded, but actual end-to-end speedup has **not** been established by a controlled benchmark. Multiple workers can increase network, disk, and server load; cache evictions may make speculative prefetch less useful. Worker count of 1 preserves prior behavior.
