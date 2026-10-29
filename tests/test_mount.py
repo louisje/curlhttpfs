@@ -281,5 +281,40 @@ class FuseIntegrationTest(unittest.TestCase):
         with self.server.request_lock:
             self.assertEqual(self.server.cache_requests, first_requests + 1)  # probe only
 
+    def test_corrupted_cached_block_is_refetched(self):
+        cache_dir = Path(self.tmp.name) / "corruption-cache"
+        with self.server.request_lock:
+            self.server.cache_requests = 0
+        with self.temporary_mount("cache", cache_dir=cache_dir) as path:
+            with open(path, "rb", buffering=0) as f:
+                self.assertEqual(f.read(128), PAYLOAD[:128])
+        blocks = [p for p in cache_dir.rglob("*") if p.is_file() and
+                  not p.name.endswith(".sha256") and not p.name.startswith(".")]
+        self.assertEqual(len(blocks), 1)
+        with open(blocks[0], "r+b") as f:
+            f.seek(42)
+            b = f.read(1)
+            f.seek(42)
+            f.write(bytes([b[0] ^ 0xff]))
+        with self.server.request_lock:
+            before = self.server.cache_requests
+        with self.temporary_mount("cache", cache_dir=cache_dir) as path:
+            with open(path, "rb", buffering=0) as f:
+                self.assertEqual(f.read(128), PAYLOAD[:128])
+        with self.server.request_lock:
+            self.assertEqual(self.server.cache_requests, before + 2)
+
+    def test_concurrent_cached_block_reads(self):
+        cache_dir = Path(self.tmp.name) / "parallel-cache"
+        with self.temporary_mount("cache", cache_dir=cache_dir) as path:
+            offsets = [i * 65536 + 20 for i in range(8)]
+            def read_at(offset):
+                with open(path, "rb", buffering=0) as f:
+                    f.seek(offset)
+                    return f.read(256)
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                actual = list(pool.map(read_at, offsets))
+            self.assertEqual(actual, [PAYLOAD[i:i+256] for i in offsets])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
