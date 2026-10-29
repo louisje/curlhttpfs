@@ -177,3 +177,10 @@ Remaining work:
 - The in-flight block of the current request is excluded from its prune pass; blocks accessed by other processes are not protected.
 - Added a GitHub Actions integration test using two remote URLs/ETags sharing one cache directory; it verifies cross-namespace eviction and refetch of evicted blocks.
 - Important caveats: quota is **best effort**, enforced when new blocks finish downloading; multiple independent mounted processes do not coordinate quota, and temporary/orphan cache files are excluded. A quota smaller than one full block plus sidecar cannot be enforced strictly while the current block is protected. Remaining improvements include cross-process locking, startup cleanup/prune, namespace directory cleanup, symlink-safe access, and stricter global disk accounting.
+
+## Shared cache process coordination and --help (2026-10-29)
+
+- A root-level `.curlhttpfs.lock` file now coordinates participating curlhttpfs processes using `flock(LOCK_EX)` for cache reads, block publication, and global LRU pruning; the lock file is created with mode 0600 and no-follow semantics. This avoids two cooperating processes racing to overwrite or evict one another's blocks. Trade-off: disk-cache reads and downloads are serialized for processes using the same cache directory, even if they access different objects; optimize locking granularity later.
+- Added native `--help` / `-h` descriptions for `url`, `filename`, `cache_dir`, and `cache_max_bytes`, with defaults, shared-quota behavior, HTTP timeout/retry notes, and a usage example. Previously only libfuse help was available and required an `url` option.
+- Added automated tests asserting help output includes the supported options and two concurrent mount processes can read successfully while sharing a one-block quota.
+- Pending work: concurrent-mount stress testing, robust symlink and cache-dir ownership validation, strict quota when multiple cache generations or temp files exist, stale temp cleanup, and finer-grained inter-process locks for throughput. `flock` is POSIX-specific; macOS/Windows filesystem frontends will require portability work.
