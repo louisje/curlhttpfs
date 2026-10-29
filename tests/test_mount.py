@@ -91,7 +91,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.server.slowcache_requests += 1
                 is_probe = start == 0 and end == 0
             if not is_probe:
-                time.sleep(0.35)
+                with self.server.request_lock:
+                    self.server.slowcache_active += 1
+                    self.server.slowcache_peak = max(self.server.slowcache_peak, self.server.slowcache_active)
+                try:
+                    time.sleep(0.35)
+                finally:
+                    with self.server.request_lock:
+                        self.server.slowcache_active -= 1
         if self.path == "/cache.bin" and requested:
             with self.server.request_lock:
                 self.server.cache_requests += 1
@@ -119,6 +126,8 @@ class FuseIntegrationTest(unittest.TestCase):
         cls.server.interrupted_requests = 0
         cls.server.cache_requests = 0
         cls.server.slowcache_requests = 0
+        cls.server.slowcache_active = 0
+        cls.server.slowcache_peak = 0
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
         cls.tmp = tempfile.TemporaryDirectory(prefix="curlhttpfs-test-")
@@ -521,6 +530,26 @@ class FuseIntegrationTest(unittest.TestCase):
                 time.sleep(0.05)
             else:
                 self.fail("configured prefetch workers did not fill cache")
+
+    def test_parallel_readahead_makes_overlapping_http_requests(self):
+        cache_dir = Path(self.tmp.name) / "range-concurrency"
+        with self.server.request_lock:
+            self.server.slowcache_peak = 0
+        with self.temporary_mount("slowcache", cache_dir=cache_dir,
+                                  readahead=1, prefetch_workers=3) as path:
+            with open(path, "rb", buffering=0) as f:
+                for _ in range(3):
+                    start = f.tell()
+                    self.assertEqual(f.read(65536), PAYLOAD[start:start + 65536])
+            deadline = time.monotonic() + 4
+            peak = 0
+            while time.monotonic() < deadline:
+                with self.server.request_lock:
+                    peak = self.server.slowcache_peak
+                if peak >= 2:
+                    break
+                time.sleep(0.05)
+            self.assertGreaterEqual(peak, 2, "prefetch ranges did not overlap")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
