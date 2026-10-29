@@ -248,3 +248,10 @@ Remaining work:
 - HTTP Range retries now honor integer-second Retry-After on 429 responses (bounded to 5 seconds) instead of always using the short exponential delay. Other failure types retain existing backoff.
 - CI adds a throttling scenario (1 MiB, 40 ms, 12 block requests per second, one trial per worker), alongside the existing latency matrix. Benchmark runs still use fresh caches; no automatic worker-count tuning is enabled.
 - Outstanding: cross-process/global rate-limit coordination, variable/real provider rate caps, adaptive concurrency that reduces pressure after 429, and careful measurement of retries, latency, and aggregate requested bytes. The simulator's per-trial counter/window and small CI sample do not establish production behavior.
+
+### Rate-limit benchmark result (Actions 40824563169)
+
+- 1 MiB, 40 ms delay, 12 block requests/second, one trial/worker. Ubuntu 22.04 workers 1/2/3/4 throughput: 0.834/0.865/0.822/0.823 MiB/s; HTTP 429 counts: 4/7/13/13.
+- Ubuntu 24.04 throughput: 0.737/0.866/0.833/0.825 MiB/s; 429 counts: 5/5/13/13.
+- Under this artificial rate cap, worker count 2 was fastest in both single trials; increasing concurrency to 3–4 doubled or tripled 429s in some runs without improving throughput. This contrasts with the earlier unconstrained latency benchmarks (3 was best).
+- Therefore keep static default=1; dynamic concurrency should be designed to respond to rate-limit signals rather than assume higher concurrency is universally better. Repeat trials before choosing production thresholds.
