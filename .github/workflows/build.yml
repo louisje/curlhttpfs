@@ -37,6 +37,7 @@ jobs:
         run: |
           python3 tests/benchmark_workers.py --size-mib 1 --latency-ms 15 --runs 2 --output benchmark-workers-15ms.json
           python3 tests/benchmark_workers.py --size-mib 2 --latency-ms 40 --runs 2 --output benchmark-workers-40ms.json
+          python3 tests/benchmark_workers.py --size-mib 1 --latency-ms 40 --rate-limit 12 --runs 1 --output benchmark-workers-throttled.json
       - name: Upload benchmark measurements
         uses: actions/upload-artifact@v4
         with:
