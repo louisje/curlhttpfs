@@ -362,5 +362,24 @@ class FuseIntegrationTest(unittest.TestCase):
         with self.server.request_lock:
             self.assertEqual(self.server.cache_requests, before + 2)
 
+    def test_help_describes_cache_options(self):
+        output = subprocess.check_output([str(Path("curlhttpfs").resolve()), "--help"], text=True)
+        for expected in ("url=URL", "filename=NAME", "cache_dir=DIR",
+                         "cache_max_bytes=N", "MOUNTPOINT", "read-only"):
+            self.assertIn(expected.lower(), output.lower())
+
+    def test_simultaneous_mounts_share_cache_safely(self):
+        cache_dir = Path(self.tmp.name) / "multiprocess-cache"
+        with self.temporary_mount("cache", cache_dir=cache_dir, cache_max_bytes=66000) as one:
+            with self.temporary_mount("cache2", cache_dir=cache_dir, cache_max_bytes=66000) as two:
+                def read_path(path):
+                    with open(path, "rb", buffering=0) as f:
+                        return f.read(128)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    results = list(pool.map(read_path, [one, two]))
+                self.assertEqual(results, [PAYLOAD[:128], PAYLOAD[:128]])
+        blocks = [p for p in cache_dir.rglob("*") if p.is_file() and len(p.name) == 16]
+        self.assertLessEqual(len(blocks), 1)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
