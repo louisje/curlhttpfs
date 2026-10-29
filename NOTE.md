@@ -208,3 +208,11 @@ Remaining work:
 - The existing single background worker processes up to the current requested lookahead depth, reusing the existing validated cache and cross-process block locks. Background work is skipped when an earlier prefetch is already queued/in flight.
 - New regression tests verify independent read-stream detection across two open file descriptors and a three-block lookahead under repeated sequential reads.
 - Remaining work: per-handle asynchronous scheduling/fairness rather than one worker, cancellation on seek/close, robust prefetch prioritization, true throughput benchmarking, and bounds on speculative bandwidth and cache churn. FUSE's own page cache/read-ahead can influence observed request shapes.
+
+## Fair prefetch scheduling and baseline benchmark (2026-10-29)
+
+- Replaced the single latest-wins prefetch slot with a bounded 16-request FIFO. Each open FUSE file gets a unique numeric stream ID. At most one queued request per stream is kept, and newer requests update that stream's position/depth without replacing other streams.
+- The background worker fetches one 64 KiB block per turn, then requeues the remaining lookahead behind other pending streams (round-robin-like fairness). Closing a file removes its queued request. An in-flight HTTP request is not cancelled and may finish.
+- Added `tests/benchmark_sequential.py`, a standalone reproducible timing tool for an already-mounted file. For meaningful comparisons: use equally sized *fresh* cache directories and the same HTTP source, file, chunk size and read amount for `readahead=0` and `readahead=1`. It reports JSON duration and throughput per run; do not treat unmeasured speedup as established.
+- Example: `python3 tests/benchmark_sequential.py /mnt/http/file.iso --size-mib 16 --chunk-kib 64 --runs 3`.
+- Known tradeoffs: one global worker still serializes HTTP speculative transfers; an active transfer may continue after file close; queue is bounded (busy streams can drop new requests); Linux kernel page caching changes read shapes and warm-cache iterations cannot be compared to cold-cache iterations. Benchmarks have been added but no production throughput conclusion is claimed.
