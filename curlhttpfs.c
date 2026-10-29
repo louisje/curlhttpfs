@@ -396,6 +396,7 @@ static void cache_prune(unsigned long long protected_block)
 {
 	if (!options.cache_max_bytes || !options.cache_dir || !cache_namespace[0]) return;
 	pthread_mutex_lock(&cache_prune_lock);
+	if (cache_global_lock() != 0) { pthread_mutex_unlock(&cache_prune_lock); return; }
 	for (;;) {
 		DIR *root = opendir(options.cache_dir);
 		if (!root) break;
@@ -441,15 +442,41 @@ static void cache_prune(unsigned long long protected_block)
 		pthread_once(&cache_once, init_cache_locks);
 		pthread_mutex_t *lock = &cache_locks[oldest_block % CACHE_LOCK_STRIPES];
 		pthread_mutex_lock(lock);
+		int candidate_fd = block_file_lock(oldest_dir, oldest_block, 1);
+		if (candidate_fd < 0) {
+			pthread_mutex_unlock(lock);
+			break; /* busy block: defer quota enforcement */
+		}
 		char path[1200], hash_path[1220];
 		if (snprintf(path, sizeof(path), "%s/%016llx", oldest_dir, oldest_block) < (int)sizeof(path) &&
 		    snprintf(hash_path, sizeof(hash_path), "%s.sha256", path) < (int)sizeof(hash_path)) {
 			unlink(path);
 			unlink(hash_path);
 		}
+		flock(candidate_fd, LOCK_UN);
+		close(candidate_fd);
 		pthread_mutex_unlock(lock);
 	}
+	cache_global_unlock();
 	pthread_mutex_unlock(&cache_prune_lock);
+}
+
+/* Advisory per-block file locks coordinate different mount processes.
+ * The global lock only covers the short quota-pruning pass. */
+static int block_file_lock(const char *directory, unsigned long long block, int nonblock)
+{
+	char path[1200];
+	if (snprintf(path, sizeof(path), "%s/.lock-%016llx", directory, block) >= (int)sizeof(path))
+		return -ENAMETOOLONG;
+	int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+	if (fd < 0) return -errno;
+	while (flock(fd, LOCK_EX | (nonblock ? LOCK_NB : 0)) < 0) {
+		if (errno == EINTR) continue;
+		int err = -errno;
+		close(fd);
+		return err;
+	}
+	return fd;
 }
 
 static int cache_block(char *dst, unsigned long long block)
@@ -465,6 +492,8 @@ static int cache_block(char *dst, unsigned long long block)
 	pthread_once(&cache_once, init_cache_locks);
 	pthread_mutex_t *lock = &cache_locks[block % CACHE_LOCK_STRIPES];
 	pthread_mutex_lock(lock);
+	int block_fd = block_file_lock(cache_namespace, block, 0);
+	if (block_fd < 0) { pthread_mutex_unlock(lock); return block_fd; }
 	FILE *file = fopen(path, "rb");
 	if (file) {
 		size_t got = fread(dst, 1, length, file);
@@ -481,6 +510,8 @@ static int cache_block(char *dst, unsigned long long block)
 				    digest_block(dst, length, actual) &&
 				    memcmp(actual, expected, 32) == 0) {
 					cache_touch(path);
+					flock(block_fd, LOCK_UN);
+					close(block_fd);
 					pthread_mutex_unlock(lock);
 					return (int)length;
 				}
@@ -519,6 +550,8 @@ static int cache_block(char *dst, unsigned long long block)
 			}
 		}
 	}
+	flock(block_fd, LOCK_UN);
+	close(block_fd);
 	pthread_mutex_unlock(lock);
 	if (result == (int)length) cache_prune(block);
 	return result;
@@ -546,8 +579,6 @@ static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
 			if (init_result != 0) return init_result;
 		}
 		if (cache_namespace[0]) {
-			int lock_result = cache_global_lock();
-			if (lock_result != 0) return lock_result;
 			size_t done = 0;
 			char block_data[CACHE_BLOCK_SIZE];
 			while (done < size) {
@@ -555,14 +586,13 @@ static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
 				unsigned long long block = position / CACHE_BLOCK_SIZE;
 				size_t within = (size_t)(position % CACHE_BLOCK_SIZE);
 				int got = cache_block(block_data, block);
-				if (got < 0) { cache_global_unlock(); return got; }
-				if ((size_t)got <= within) { cache_global_unlock(); return -EIO; }
+				if (got < 0) return got;
+				if ((size_t)got <= within) return -EIO;
 				size_t amount = (size_t)got - within;
 				if (amount > size - done) amount = size - done;
 				memcpy(buf + done, block_data + within, amount);
 				done += amount;
 			}
-			cache_global_unlock();
 			return (int)done;
 		}
 	}
@@ -588,7 +618,7 @@ static void print_httpfs_help(const char *program)
 	       "  cache_max_bytes=N   Maximum shared disk cache bytes (default: 0 = unlimited)\\n"
 	       "\\nThe quota applies across URLs and ETag versions in cache_dir.\\n"
 	       "HTTP Range reads use 5s connection / 15s request timeouts and up to 3 attempts.\\n"
-	       "Cache reads/writes are serialized across processes sharing cache_dir.\\n"
+	       "Concurrent cache blocks use per-block locks; global eviction is serialized.\\n"
 	       "\\nFUSE options: see fusermount3 and libfuse documentation.\\n",
 	       program);
 }
