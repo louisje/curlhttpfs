@@ -151,3 +151,12 @@ Remaining work:
 - [ ] Separate the caching core from the FUSE adapter before macOS/Windows ports.
 - [ ] Coordinate concurrent readers/cache misses without serializing all reads; only the initial version uses one mutex for disk-cache operations.
 - [ ] Consider Last-Modified fallback and behavior when a remote file changes during a mount.
+
+## Cache integrity and concurrency improvement (2026-10-29)
+
+- Implemented SHA-256 sidecar (`.sha256`, 32 raw bytes) for each persistent 64 KiB block. Reads validate both the exact length and digest; missing, truncated, or same-size corrupted blocks are fetched again. Legacy cache blocks without sidecars are refetched.
+- Replaced the single cache mutex with 64 striped locks indexed by block number: different stripes may download concurrently, while the same block is deduplicated within a process.
+- Serialized cache namespace initialization separately, and migrated namespace digest generation from deprecated SHA256 context routines to OpenSSL EVP.
+- Added tests for same-size cache corruption and concurrent cached reads.
+- Security / limitations: a sidecar hash detects accidental corruption only; it is **not authenticated** against malicious modification of both block and hash. Cache directory should be private. Multi-process coordination, atomic publication of block and sidecar as a pair, stronger filesystem durability, quota/LRU eviction, symlink-hardening, and lock contention benchmarks remain outstanding.
+- Validate new work on Ubuntu 22.04 and 24.04 GitHub Actions; passing existing smoke tests is not sufficient.
