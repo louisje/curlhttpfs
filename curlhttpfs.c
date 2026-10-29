@@ -31,6 +31,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <time.h>
+#include <sys/file.h>
 #include <openssl/evp.h>
 
 struct options {
@@ -310,6 +311,24 @@ static void init_cache_locks(void)
 		pthread_mutex_init(&cache_locks[i], NULL);
 }
 static char cache_namespace[1024];
+static int cache_lock_fd = -1;
+
+/* The root lock serializes cache readers/writers and global pruning across
+ * processes sharing a directory. Other HTTP mounts do not need this lock. */
+static int cache_global_lock(void)
+{
+	if (cache_lock_fd < 0) return -EIO;
+	while (flock(cache_lock_fd, LOCK_EX) < 0) {
+		if (errno != EINTR) return -errno;
+	}
+	return 0;
+}
+
+static void cache_global_unlock(void)
+{
+	if (cache_lock_fd >= 0) flock(cache_lock_fd, LOCK_UN);
+}
+
 
 static int cache_init(void)
 {
@@ -319,6 +338,12 @@ static int cache_init(void)
 	if (!options.cache_dir || !options.cache_dir[0] ||
 	    httpfs_file.etag[0] != '"' ) return 0;
 	if (mkdir(options.cache_dir, 0700) != 0 && errno != EEXIST) return -errno;
+	if (cache_lock_fd < 0) {
+		char lock_path[1200];
+		if (snprintf(lock_path, sizeof(lock_path), "%s/.curlhttpfs.lock", options.cache_dir) >= (int)sizeof(lock_path)) return -ENAMETOOLONG;
+		cache_lock_fd = open(lock_path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+		if (cache_lock_fd < 0) return -errno;
+	}
 	ctx = EVP_MD_CTX_new();
 	if (!ctx) return -ENOMEM;
 	int hashed = EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1 &&
@@ -516,6 +541,8 @@ static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
 			if (init_result != 0) return init_result;
 		}
 		if (cache_namespace[0]) {
+			int lock_result = cache_global_lock();
+			if (lock_result != 0) return lock_result;
 			size_t done = 0;
 			char block_data[CACHE_BLOCK_SIZE];
 			while (done < size) {
@@ -523,13 +550,14 @@ static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
 				unsigned long long block = position / CACHE_BLOCK_SIZE;
 				size_t within = (size_t)(position % CACHE_BLOCK_SIZE);
 				int got = cache_block(block_data, block);
-				if (got < 0) return got;
-				if ((size_t)got <= within) return -EIO;
+				if (got < 0) { cache_global_unlock(); return got; }
+				if ((size_t)got <= within) { cache_global_unlock(); return -EIO; }
 				size_t amount = (size_t)got - within;
 				if (amount > size - done) amount = size - done;
 				memcpy(buf + done, block_data + within, amount);
 				done += amount;
 			}
+			cache_global_unlock();
 			return (int)done;
 		}
 	}
@@ -544,8 +572,31 @@ static struct fuse_operations httpfs_oper = {
 	.read		= httpfs_read,
 };
 
+static void print_httpfs_help(const char *program)
+{
+	printf("Usage: %s -o url=URL[,filename=NAME][,cache_dir=DIR][,cache_max_bytes=N] MOUNTPOINT [FUSE options]\\n"
+	       "\\nRead-only HTTP Range filesystem (64 KiB disk cache blocks).\\n"
+	       "\\nHTTPFS options (-o key=value):\\n"
+	       "  url=URL             Remote HTTP(S) file (required)\\n"
+	       "  filename=NAME       Local filename in the mounted directory (default: URL basename)\\n"
+	       "  cache_dir=DIR       Optional persistent disk cache; requires strong ETag\\n"
+	       "  cache_max_bytes=N   Maximum shared disk cache bytes (default: 0 = unlimited)\\n"
+	       "\\nThe quota applies across URLs and ETag versions in cache_dir.\\n"
+	       "HTTP Range reads use 5s connection / 15s request timeouts and up to 3 attempts.\\n"
+	       "Cache reads/writes are serialized across processes sharing cache_dir.\\n"
+	       "\\nFUSE options: see fusermount3 and libfuse documentation.\\n",
+	       program);
+}
+
 int main(int argc, char *argv[])
 {
+	for (int i = 1; i < argc; ++i) {
+		if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+			print_httpfs_help(argv[0]);
+			return 0;
+		}
+	}
+
 	char temp_url[512];
 	char *str;
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
