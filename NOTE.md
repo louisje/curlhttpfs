@@ -240,3 +240,11 @@ Remaining work:
 - Both single-run measurements favor 3 over 4, but the sample size is inadequate for choosing the production default or enabling runtime autotuning.
 - Extend CI to two repeatable scenarios: 1 MiB at 15 ms, and 2 MiB at 40 ms; two fresh-cache repetitions per worker count. Each scenario exports an independent JSON artifact. Differences reflect simulated HTTP latency, not a guarantee of real-world storage performance.
 - Keep `prefetch_workers` default = 1. Consider automatic adjustment only after larger repeated trials, server-side request-rate limits, bandwidth costs, cache hit rates, and real provider behavior have been characterized.
+
+## HTTP rate-limit benchmarking and Retry-After (2026-10-29)
+
+- Previous benchmark run 40821240582, 2 MiB per trial / 40 ms Range delay / two runs: Ubuntu 22.04 workers 1/2/3/4 = 1.270/2.044/2.167/2.146 MiB/s; Ubuntu 24.04 = 1.284/1.987/2.129/2.073 MiB/s. These figures are local simulator measurements, not provider benchmarks.
+- `tests/benchmark_workers.py` now supports `--rate-limit=N` for a server-side one-second-window request cap. It emits HTTP 429 and `Retry-After: 1` when the block request rate is exceeded, and records `throttled_429` per trial. Probe requests are excluded from the simulated limit.
+- HTTP Range retries now honor integer-second Retry-After on 429 responses (bounded to 5 seconds) instead of always using the short exponential delay. Other failure types retain existing backoff.
+- CI adds a throttling scenario (1 MiB, 40 ms, 12 block requests per second, one trial per worker), alongside the existing latency matrix. Benchmark runs still use fresh caches; no automatic worker-count tuning is enabled.
+- Outstanding: cross-process/global rate-limit coordination, variable/real provider rate caps, adaptive concurrency that reduces pressure after 429, and careful measurement of retries, latency, and aggregate requested bytes. The simulator's per-trial counter/window and small CI sample do not establish production behavior.
