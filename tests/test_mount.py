@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end test: loopback HTTP range server -> FUSE mount -> random reads."""
 import contextlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 import http.server
 import os
@@ -491,6 +492,16 @@ class FuseIntegrationTest(unittest.TestCase):
                     time.sleep(0.05)
                 else:
                     self.fail("adaptive readahead did not fetch three future blocks after a sequential stream")
+
+    def test_benchmark_cli_reports_measured_bytes(self):
+        output = subprocess.check_output([
+            "python3", "tests/benchmark_sequential.py",
+            str(self.mountpoint / "test.bin"), "--size-mib", "1",
+            "--chunk-kib", "64", "--runs", "1"
+        ], text=True)
+        measurements = json.loads(output)
+        self.assertEqual(measurements["bytes"], [1048576])
+        self.assertGreater(measurements["median_mib_per_sec"], 0)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
