@@ -28,7 +28,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.respond(head_only=False)
 
     def respond(self, head_only):
-        if self.path not in ("/test.bin", "/bad.bin", "/flaky.bin", "/empty.bin", "/changed.bin", "/interrupted.bin", "/cache.bin"):
+        if self.path not in ("/test.bin", "/bad.bin", "/flaky.bin", "/empty.bin", "/changed.bin", "/interrupted.bin", "/cache.bin", "/cache2.bin"):
             self.send_error(404)
             return
         if self.path == "/empty.bin":
@@ -91,8 +91,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(206 if requested else 200)
         self.send_header("Content-Length", str(end - start + 1))
         self.send_header("Accept-Ranges", "bytes")
-        if self.path in ("/changed.bin", "/cache.bin"):
-            self.send_header("ETag", '"v1"')
+        if self.path in ("/changed.bin", "/cache.bin", "/cache2.bin"):
+            self.send_header("ETag", '"v2"' if self.path == "/cache2.bin" else '"v1"')
         if requested:
             self.send_header("Content-Range", f"bytes {start + (1 if self.path == '/bad.bin' else 0)}-{end}/{len(PAYLOAD)}")
         self.end_headers()
@@ -336,6 +336,31 @@ class FuseIntegrationTest(unittest.TestCase):
             with open(path, "rb", buffering=0) as f:
                 f.seek(65536 + 10)
                 self.assertEqual(f.read(100), PAYLOAD[65546:65646])
+
+    def test_global_quota_across_urls_and_versions(self):
+        cache_dir = Path(self.tmp.name) / "shared-global-cache"
+        quota = 66000
+        with self.temporary_mount("cache", cache_dir=cache_dir,
+                                  cache_max_bytes=quota) as path:
+            with open(path, "rb", buffering=0) as f:
+                self.assertEqual(f.read(100), PAYLOAD[:100])
+        with self.temporary_mount("cache2", cache_dir=cache_dir,
+                                  cache_max_bytes=quota) as path:
+            with open(path, "rb", buffering=0) as f:
+                self.assertEqual(f.read(100), PAYLOAD[:100])
+        namespaces = [p for p in cache_dir.iterdir() if p.is_dir()]
+        self.assertEqual(len(namespaces), 2)
+        blocks = [p for p in cache_dir.rglob("*")
+                  if p.is_file() and len(p.name) == 16]
+        self.assertEqual(len(blocks), 1)
+        with self.server.request_lock:
+            before = self.server.cache_requests
+        with self.temporary_mount("cache", cache_dir=cache_dir,
+                                  cache_max_bytes=quota) as path:
+            with open(path, "rb", buffering=0) as f:
+                self.assertEqual(f.read(100), PAYLOAD[:100])
+        with self.server.request_lock:
+            self.assertEqual(self.server.cache_requests, before + 2)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
