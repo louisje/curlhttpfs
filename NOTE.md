@@ -200,3 +200,11 @@ Remaining work:
 - The worker uses existing HTTP timeout/retry, per-block interprocess locking, SHA-256 validation, and LRU quota code; completion is not required for the foreground read to succeed.
 - Added integration tests for sequential prefetch and random-access bypass. `--help` includes the new option.
 - Outstanding: real sequential-stream benchmarks, per-open-file rather than global sequence detection, cancellation/reprioritization, tuning of prefetch depth, adaptive disabling on slow networks, and shutdown behavior under a stalled HTTP request. Background requests may use additional bandwidth and cache quota.
+
+## Per-open sequential detection and adaptive read-ahead (2026-10-29)
+
+- Each FUSE open now creates a separate read-stream state stored in `fuse_file_info.fh`, destroyed by the release callback. Sequential-detection offsets and streak lengths no longer interfere between independent file handles.
+- With `readahead=1` and a usable persistent cache, consecutive reads advance a bounded lookahead depth from 1 to 3 aligned 64 KiB blocks. Random seeks reset the stream's streak; speculative prefetch continues to be disabled by default.
+- The existing single background worker processes up to the current requested lookahead depth, reusing the existing validated cache and cross-process block locks. Background work is skipped when an earlier prefetch is already queued/in flight.
+- New regression tests verify independent read-stream detection across two open file descriptors and a three-block lookahead under repeated sequential reads.
+- Remaining work: per-handle asynchronous scheduling/fairness rather than one worker, cancellation on seek/close, robust prefetch prioritization, true throughput benchmarking, and bounds on speculative bandwidth and cache churn. FUSE's own page cache/read-ahead can influence observed request shapes.
