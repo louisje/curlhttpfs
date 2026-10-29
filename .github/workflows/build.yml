@@ -33,3 +33,11 @@ jobs:
           test -c /dev/fuse
       - name: HTTP Range + mounted filesystem tests
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Benchmark prefetch workers (loopback, informational)
+        run: |
+          python3 tests/benchmark_workers.py --size-mib 1 --latency-ms 15 --runs 1 --output benchmark-workers.json
+      - name: Upload benchmark measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-workers-${{ matrix.os }}
+          path: benchmark-workers.json
