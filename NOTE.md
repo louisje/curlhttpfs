@@ -184,3 +184,11 @@ Remaining work:
 - Added native `--help` / `-h` descriptions for `url`, `filename`, `cache_dir`, and `cache_max_bytes`, with defaults, shared-quota behavior, HTTP timeout/retry notes, and a usage example. Previously only libfuse help was available and required an `url` option.
 - Added automated tests asserting help output includes the supported options and two concurrent mount processes can read successfully while sharing a one-block quota.
 - Pending work: concurrent-mount stress testing, robust symlink and cache-dir ownership validation, strict quota when multiple cache generations or temp files exist, stale temp cleanup, and finer-grained inter-process locks for throughput. `flock` is POSIX-specific; macOS/Windows filesystem frontends will require portability work.
+
+## Per-block inter-process cache locks (2026-10-29)
+
+- Replaced the former root-wide cache lock for every read with advisory `flock` files named `.lock-<16-hex-block-id>` within each URL/strong-ETag namespace. Two mounts can fetch **different blocks** concurrently. Matching blocks coordinate to avoid duplicate writes and validate the existing SHA-256 sidecar.
+- Global `.curlhttpfs.lock` is retained for the short LRU quota pruning pass. Pruning tries to lock the candidate block non-blockingly and defers eviction if the candidate is in use. The existing in-process striped locks remain for FUSE worker threads.
+- Added an integration test with two simultaneous FUSE mount processes using the same remote file and shared cache, each reading a different delayed HTTP range to detect unintended cross-process serialization.
+- Limitations: best-effort quota can temporarily exceed the limit while blocks are busy; lock files persist and are not part of capacity accounting. `flock` is Unix-specific. Startup cleanup, orphan lock-file management, symlink/ownership hardening, and more extensive concurrency stress tests remain outstanding.
+- Do not claim measured speedups without benchmarks; verify each Ubuntu Actions matrix job.
