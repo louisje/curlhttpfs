@@ -29,7 +29,7 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <sys/stat.h>
-#include <openssl/sha.h>
+#include <openssl/evp.h>
 
 struct options {
 	char *target_url;
@@ -294,22 +294,34 @@ static int read_curl_buffer(size_t size, off_t offset, httpfs_buffer_t *buffer)
 /* Optional 64-KiB on-disk block cache, enabled only for strong ETags.
  * Each mount probes the remote object before using any cached blocks. */
 #define CACHE_BLOCK_SIZE 65536U
-static pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
+#define CACHE_LOCK_STRIPES 64
+static pthread_mutex_t cache_locks[CACHE_LOCK_STRIPES];
+static pthread_once_t cache_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t cache_init_lock = PTHREAD_MUTEX_INITIALIZER;
+static void init_cache_locks(void)
+{
+	for (size_t i = 0; i < CACHE_LOCK_STRIPES; ++i)
+		pthread_mutex_init(&cache_locks[i], NULL);
+}
 static char cache_namespace[1024];
 
 static int cache_init(void)
 {
-	unsigned char digest[SHA256_DIGEST_LENGTH];
-	SHA256_CTX ctx;
+	unsigned char digest[32];
+	EVP_MD_CTX *ctx;
 	char hex[SHA256_DIGEST_LENGTH * 2 + 1];
 	if (!options.cache_dir || !options.cache_dir[0] ||
 	    httpfs_file.etag[0] != '"' ) return 0;
 	if (mkdir(options.cache_dir, 0700) != 0 && errno != EEXIST) return -errno;
-	SHA256_Init(&ctx);
-	SHA256_Update(&ctx, options.target_url, strlen(options.target_url));
-	SHA256_Update(&ctx, "\0", 1);
-	SHA256_Update(&ctx, httpfs_file.etag, strlen(httpfs_file.etag));
-	SHA256_Final(digest, &ctx);
+	ctx = EVP_MD_CTX_new();
+	if (!ctx) return -ENOMEM;
+	int hashed = EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1 &&
+	    EVP_DigestUpdate(ctx, options.target_url, strlen(options.target_url)) == 1 &&
+	    EVP_DigestUpdate(ctx, "\0", 1) == 1 &&
+	    EVP_DigestUpdate(ctx, httpfs_file.etag, strlen(httpfs_file.etag)) == 1 &&
+	    EVP_DigestFinal_ex(ctx, digest, NULL) == 1;
+	EVP_MD_CTX_free(ctx);
+	if (!hashed) return -EIO;
 	for (size_t i = 0; i < sizeof(digest); ++i)
 		snprintf(hex + i * 2, 3, "%02x", digest[i]);
 	if (snprintf(cache_namespace, sizeof(cache_namespace), "%s/%s",
@@ -318,29 +330,54 @@ static int cache_init(void)
 	return 0;
 }
 
+static int digest_block(const char *data, size_t length, unsigned char digest[32])
+{
+	unsigned int n = 0;
+	return EVP_Digest(data, length, digest, &n, EVP_sha256(), NULL) == 1 && n == 32;
+}
+
 static int cache_block(char *dst, unsigned long long block)
 {
-	char path[1200], tmp[1250];
+	char path[1200], hash_path[1220], tmp[1250], hash_tmp[1250];
 	unsigned long long offset = block * CACHE_BLOCK_SIZE;
 	size_t length = (size_t)((unsigned long long)httpfs_file.size - offset);
 	if (length > CACHE_BLOCK_SIZE) length = CACHE_BLOCK_SIZE;
 	if (snprintf(path, sizeof(path), "%s/%016llx", cache_namespace, block) >= (int)sizeof(path))
 		return -ENAMETOOLONG;
-	pthread_mutex_lock(&cache_lock);
+	if (snprintf(hash_path, sizeof(hash_path), "%s.sha256", path) >= (int)sizeof(hash_path))
+		return -ENAMETOOLONG;
+	pthread_once(&cache_once, init_cache_locks);
+	pthread_mutex_t *lock = &cache_locks[block % CACHE_LOCK_STRIPES];
+	pthread_mutex_lock(lock);
 	FILE *file = fopen(path, "rb");
 	if (file) {
 		size_t got = fread(dst, 1, length, file);
 		int extra = fgetc(file);
 		fclose(file);
 		if (got == length && extra == EOF) {
-			pthread_mutex_unlock(&cache_lock);
-			return (int)length;
+			unsigned char expected[32], actual[32];
+			FILE *hash = fopen(hash_path, "rb");
+			if (hash) {
+				size_t h = fread(expected, 1, sizeof(expected), hash);
+				int trailing = fgetc(hash);
+				fclose(hash);
+				if (h == 32 && trailing == EOF &&
+				    digest_block(dst, length, actual) &&
+				    memcmp(actual, expected, 32) == 0) {
+					pthread_mutex_unlock(lock);
+					return (int)length;
+				}
+			}
 		}
 	}
+	/* Missing, truncated or corrupted blocks are fetched again. */
 	httpfs_buffer_t buffer = {dst, 0, length};
 	int result = read_curl_buffer(length, (off_t)offset, &buffer);
 	if (result == (int)length) {
-		if (snprintf(tmp, sizeof(tmp), "%s/.tmp-XXXXXX", cache_namespace) < (int)sizeof(tmp)) {
+		unsigned char digest[32];
+		if (digest_block(dst, length, digest) &&
+		    snprintf(tmp, sizeof(tmp), "%s/.tmp-XXXXXX", cache_namespace) < (int)sizeof(tmp) &&
+		    snprintf(hash_tmp, sizeof(hash_tmp), "%s/.hash-XXXXXX", cache_namespace) < (int)sizeof(hash_tmp)) {
 			int fd = mkstemp(tmp);
 			if (fd >= 0) {
 				size_t written = 0;
@@ -349,15 +386,23 @@ static int cache_block(char *dst, unsigned long long block)
 					if (n <= 0) break;
 					written += (size_t)n;
 				}
-				if (written == length && fsync(fd) == 0 && close(fd) == 0) {
-					fd = -1;
-					if (rename(tmp, path) != 0) unlink(tmp);
-				}
-				if (fd >= 0) { close(fd); unlink(tmp); }
+				int persisted = written == length && fsync(fd) == 0;
+				if (close(fd) != 0) persisted = 0;
+				if (persisted) {
+					int hd = mkstemp(hash_tmp);
+					if (hd >= 0) {
+						int hash_ok = write(hd, digest, 32) == 32 && fsync(hd) == 0;
+						if (close(hd) != 0) hash_ok = 0;
+						if (hash_ok && rename(tmp, path) == 0) {
+							if (rename(hash_tmp, hash_path) != 0) unlink(hash_path);
+						} else unlink(tmp);
+						unlink(hash_tmp);
+					}
+				} else unlink(tmp);
 			}
 		}
 	}
-	pthread_mutex_unlock(&cache_lock);
+	pthread_mutex_unlock(lock);
 	return result;
 }
 
@@ -376,7 +421,12 @@ static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
 		size = (size_t)(httpfs_file.size - (curl_off_t)offset);
 	if (size > INT_MAX) size = INT_MAX;
 	if (options.cache_dir && options.cache_dir[0]) {
-		if (!cache_namespace[0] && cache_init() != 0) return -EIO;
+		if (!cache_namespace[0]) {
+			pthread_mutex_lock(&cache_init_lock);
+			int init_result = cache_namespace[0] ? 0 : cache_init();
+			pthread_mutex_unlock(&cache_init_lock);
+			if (init_result != 0) return init_result;
+		}
 		if (cache_namespace[0]) {
 			size_t done = 0;
 			char block_data[CACHE_BLOCK_SIZE];
