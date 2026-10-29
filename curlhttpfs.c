@@ -39,6 +39,7 @@ struct options {
 	char *target_filename;
 	char *cache_dir;
 	unsigned long long cache_max_bytes;
+	int readahead;
 } options;
 
 #define MY_OPT_KEY(t, p, v) { t, offsetof(struct options, p), v }
@@ -48,6 +49,7 @@ static struct fuse_opt httpfs_opts[] = {
 	MY_OPT_KEY("filename=%s", target_filename, 0),
 	MY_OPT_KEY("cache_dir=%s", cache_dir, 0),
 	MY_OPT_KEY("cache_max_bytes=%llu", cache_max_bytes, 0),
+	MY_OPT_KEY("readahead=%d", readahead, 0),
 	FUSE_OPT_END
 };
 
@@ -559,6 +561,50 @@ static int cache_block(char *dst, unsigned long long block)
 	return result;
 }
 
+/* Single background prefetch worker. It never outlives fuse_main. */
+static pthread_mutex_t prefetch_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t prefetch_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t prefetch_thread;
+static int prefetch_started, prefetch_shutdown, prefetch_pending, prefetch_busy;
+static unsigned long long prefetch_block;
+static off_t sequential_end = -1;
+
+static void *prefetch_worker(void *unused)
+{
+	(void)unused;
+	char *data = malloc(CACHE_BLOCK_SIZE);
+	if (!data) return NULL;
+	pthread_mutex_lock(&prefetch_lock);
+	while (!prefetch_shutdown) {
+		while (!prefetch_pending && !prefetch_shutdown)
+			pthread_cond_wait(&prefetch_cond, &prefetch_lock);
+		if (prefetch_shutdown) break;
+		unsigned long long block = prefetch_block;
+		prefetch_pending = 0;
+		prefetch_busy = 1;
+		pthread_mutex_unlock(&prefetch_lock);
+		cache_block(data, block);
+		pthread_mutex_lock(&prefetch_lock);
+		prefetch_busy = 0;
+	}
+	pthread_mutex_unlock(&prefetch_lock);
+	free(data);
+	return NULL;
+}
+
+static void schedule_prefetch(unsigned long long next)
+{
+	if (next >= ((unsigned long long)httpfs_file.size + CACHE_BLOCK_SIZE - 1) / CACHE_BLOCK_SIZE)
+		return;
+	pthread_mutex_lock(&prefetch_lock);
+	if (prefetch_started && !prefetch_shutdown && !prefetch_pending && !prefetch_busy) {
+		prefetch_block = next;
+		prefetch_pending = 1;
+		pthread_cond_signal(&prefetch_cond);
+	}
+	pthread_mutex_unlock(&prefetch_lock);
+}
+
 static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
                       struct fuse_file_info *fi)
 {
@@ -595,6 +641,14 @@ static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
 				memcpy(buf + done, block_data + within, amount);
 				done += amount;
 			}
+			if (options.readahead) {
+				pthread_mutex_lock(&prefetch_lock);
+				int sequential = sequential_end == offset;
+				sequential_end = offset + (off_t)done;
+				pthread_mutex_unlock(&prefetch_lock);
+				if (sequential && done > 0)
+					schedule_prefetch(((unsigned long long)offset + done + CACHE_BLOCK_SIZE - 1) / CACHE_BLOCK_SIZE);
+			}
 			return (int)done;
 		}
 	}
@@ -607,17 +661,29 @@ static struct fuse_operations httpfs_oper = {
 	.readdir	= httpfs_readdir,
 	.open		= httpfs_open,
 	.read		= httpfs_read,
+	.destroy = httpfs_destroy,
 };
+
+static void httpfs_destroy(void *private_data)
+{
+	(void)private_data;
+	pthread_mutex_lock(&prefetch_lock);
+	prefetch_shutdown = 1;
+	pthread_cond_signal(&prefetch_cond);
+	pthread_mutex_unlock(&prefetch_lock);
+	if (prefetch_started) pthread_join(prefetch_thread, NULL);
+}
 
 static void print_httpfs_help(const char *program)
 {
-	printf("Usage: %s -o url=URL[,filename=NAME][,cache_dir=DIR][,cache_max_bytes=N] MOUNTPOINT [FUSE options]\\n"
+	printf("Usage: %s -o url=URL[,filename=NAME][,cache_dir=DIR][,cache_max_bytes=N][,readahead=1] MOUNTPOINT [FUSE options]\\n"
 	       "\\nRead-only HTTP Range filesystem (64 KiB disk cache blocks).\\n"
 	       "\\nHTTPFS options (-o key=value):\\n"
 	       "  url=URL             Remote HTTP(S) file (required)\\n"
 	       "  filename=NAME       Local filename in the mounted directory (default: URL basename)\\n"
 	       "  cache_dir=DIR       Optional persistent disk cache; requires strong ETag\\n"
 	       "  cache_max_bytes=N   Maximum shared disk cache bytes (default: 0 = unlimited)\\n"
+	       "  readahead=1         Prefetch one block on sequential reads (default: disabled)\\n"
 	       "\\nThe quota applies across URLs and ETag versions in cache_dir.\\n"
 	       "HTTP Range reads use 5s connection / 15s request timeouts and up to 3 attempts.\\n"
 	       "Concurrent cache blocks use per-block locks; global eviction is serialized.\\n"
@@ -673,6 +739,10 @@ int main(int argc, char *argv[])
 	{
 		if (snprintf(httpfs_file.filename, sizeof(httpfs_file.filename), "/%s", options.target_filename) >= (int)sizeof(httpfs_file.filename))
 		return 1;
+	}
+
+	if (options.readahead && options.cache_dir && options.cache_dir[0]) {
+		if (pthread_create(&prefetch_thread, NULL, prefetch_worker, NULL) == 0) prefetch_started = 1;
 	}
 
 	if (fuse_main(args.argc, args.argv, &httpfs_oper, NULL))
