@@ -201,7 +201,7 @@ class FuseIntegrationTest(unittest.TestCase):
             self.assertEqual(data, PAYLOAD[start:start + 4096])
 
     @contextlib.contextmanager
-    def temporary_mount(self, name, cache_dir=None, cache_max_bytes=None, readahead=None):
+    def temporary_mount(self, name, cache_dir=None, cache_max_bytes=None, readahead=None, prefetch_workers=None):
         mount = Path(self.tmp.name) / name
         mount.mkdir(exist_ok=True)
         port = self.server.server_address[1]
@@ -212,6 +212,8 @@ class FuseIntegrationTest(unittest.TestCase):
             opts += f",cache_max_bytes={cache_max_bytes}"
         if readahead is not None:
             opts += f",readahead={readahead}"
+        if prefetch_workers is not None:
+            opts += f",prefetch_workers={prefetch_workers}"
         proc = subprocess.Popen(
             [str(Path("curlhttpfs").resolve()), "-f", "-s",
              "-o", opts,
@@ -502,6 +504,23 @@ class FuseIntegrationTest(unittest.TestCase):
         measurements = json.loads(output)
         self.assertEqual(measurements["bytes"], [1048576])
         self.assertGreater(measurements["median_mib_per_sec"], 0)
+
+    def test_parallel_prefetch_workers_option(self):
+        cache_dir = Path(self.tmp.name) / "workers-cache"
+        with self.temporary_mount("cache", cache_dir=cache_dir,
+                                  readahead=1, prefetch_workers=3) as path:
+            with open(path, "rb", buffering=0) as f:
+                self.assertEqual(f.read(65536), PAYLOAD[:65536])
+                self.assertEqual(f.read(65536), PAYLOAD[65536:131072])
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline:
+                blocks = {p.name for p in cache_dir.rglob("*") if p.is_file()
+                          and re.fullmatch(r"[0-9a-f]{16}", p.name)}
+                if "0000000000000003" in blocks:
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("configured prefetch workers did not fill cache")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
