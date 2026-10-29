@@ -643,7 +643,7 @@ static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
 			}
 			if (options.readahead) {
 				pthread_mutex_lock(&prefetch_lock);
-				int sequential = sequential_end == offset;
+				int sequential = sequential_end == offset || (sequential_end < 0 && offset == 0);
 				sequential_end = offset + (off_t)done;
 				pthread_mutex_unlock(&prefetch_lock);
 				if (sequential && done > 0)
