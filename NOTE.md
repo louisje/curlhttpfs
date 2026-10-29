@@ -169,3 +169,11 @@ Remaining work:
 - Added a FUSE integration test with a one-block quota, verifying eviction and reuse after remount.
 - This first quota is **per object version**, not a global directory quota. Cache namespaces for older versions are not cleaned automatically; therefore total use of `cache_dir` can still grow unbounded across different URLs/ETags.
 - Remaining: global quota across namespaces, multi-process safe eviction/locking, orphan temp/sidecar cleanup, directory permissions/symlink hardening, eviction benchmarks under concurrent access, and configurable policies. Timestamp-based LRU is approximate rather than a strict access-order index.
+
+## Global cache quota (2026-10-29)
+
+- Changed `cache_max_bytes=N` from a per-URL/ETag namespace budget to a **shared budget across every recognized cache namespace in `cache_dir`**. Each namespace remains keyed by URL and strong ETag, preserving existing block filenames and SHA-256 sidecars.
+- Pruning scans all 64-character hex namespace directories and their 16-character hex block filenames, counts payload plus SHA-256 sidecar sizes, and evicts oldest blocks according to access-updated mtime until under budget. Directories belonging to other versions or URLs can now be reclaimed without deleting namespace directories.
+- The in-flight block of the current request is excluded from its prune pass; blocks accessed by other processes are not protected.
+- Added a GitHub Actions integration test using two remote URLs/ETags sharing one cache directory; it verifies cross-namespace eviction and refetch of evicted blocks.
+- Important caveats: quota is **best effort**, enforced when new blocks finish downloading; multiple independent mounted processes do not coordinate quota, and temporary/orphan cache files are excluded. A quota smaller than one full block plus sidecar cannot be enforced strictly while the current block is protected. Remaining improvements include cross-process locking, startup cleanup/prune, namespace directory cleanup, symlink-safe access, and stricter global disk accounting.
