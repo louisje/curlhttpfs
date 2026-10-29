@@ -195,7 +195,7 @@ class FuseIntegrationTest(unittest.TestCase):
     @contextlib.contextmanager
     def temporary_mount(self, name, cache_dir=None):
         mount = Path(self.tmp.name) / name
-        mount.mkdir()
+        mount.mkdir(exist_ok=True)
         port = self.server.server_address[1]
         opts = f"url=http://127.0.0.1:{port}/{name}.bin,filename=remote.bin"
         if cache_dir is not None:
