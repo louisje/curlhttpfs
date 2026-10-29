@@ -160,3 +160,12 @@ Remaining work:
 - Added tests for same-size cache corruption and concurrent cached reads.
 - Security / limitations: a sidecar hash detects accidental corruption only; it is **not authenticated** against malicious modification of both block and hash. Cache directory should be private. Multi-process coordination, atomic publication of block and sidecar as a pair, stronger filesystem durability, quota/LRU eviction, symlink-hardening, and lock contention benchmarks remain outstanding.
 - Validate new work on Ubuntu 22.04 and 24.04 GitHub Actions; passing existing smoke tests is not sufficient.
+
+## Bounded persistent cache and LRU (2026-10-29)
+
+- Added optional FUSE mount option `cache_max_bytes=N`, used with `cache_dir=PATH`; `N` is a byte quota for **one URL + strong ETag cache namespace**. Example: `-o url=https://host/file.iso,cache_dir=/private/cache,cache_max_bytes=67108864` (64 MiB).
+- When a successful block download is persisted, scan the current namespace and evict least-recently-used eligible blocks until their combined payload and SHA-256 sidecar sizes fit the quota. Cache hits refresh the payload timestamp; eviction removes both the block and its sidecar.
+- The just-requested block is protected during its own prune pass; set the limit to at least 65568 bytes to fit a regular 64-KiB block and hash sidecar. `cache_max_bytes=0` means no quota, for backward compatibility.
+- Added a FUSE integration test with a one-block quota, verifying eviction and reuse after remount.
+- This first quota is **per object version**, not a global directory quota. Cache namespaces for older versions are not cleaned automatically; therefore total use of `cache_dir` can still grow unbounded across different URLs/ETags.
+- Remaining: global quota across namespaces, multi-process safe eviction/locking, orphan temp/sidecar cleanup, directory permissions/symlink hardening, eviction benchmarks under concurrent access, and configurable policies. Timestamp-based LRU is approximate rather than a strict access-order index.
