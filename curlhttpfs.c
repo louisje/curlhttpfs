@@ -633,21 +633,24 @@ static void *prefetch_worker(void *unused)
 		prefetch_request_t request = prefetch_queue[prefetch_head];
 		prefetch_head = (prefetch_head + 1) % PREFETCH_SLOTS;
 		--prefetch_count;
-		pthread_mutex_unlock(&prefetch_lock);
-		int result = cache_block(data, request.block);
-		pthread_mutex_lock(&prefetch_lock);
-		if (result >= 0 && request.remaining > 1 && !prefetch_shutdown &&
-		    request.block + 1 < ((unsigned long long)httpfs_file.size + CACHE_BLOCK_SIZE - 1) / CACHE_BLOCK_SIZE) {
+		/* Expose the next block before downloading this one so another
+		 * worker can run a different HTTP Range concurrently. */
+		if (request.remaining > 1 && !prefetch_shutdown &&
+		    request.block + 1 < ((unsigned long long)httpfs_file.size + CACHE_BLOCK_SIZE - 1) / CACHE_BLOCK_SIZE &&
+		    prefetch_count < PREFETCH_SLOTS) {
 			int superseded = 0;
 			for (unsigned int i = 0; i < prefetch_count; ++i)
 				if (prefetch_queue[(prefetch_head + i) % PREFETCH_SLOTS].stream_id == request.stream_id)
 					superseded = 1;
-			if (!superseded && prefetch_count < PREFETCH_SLOTS) {
-				request.block++;
-				request.remaining--;
-				prefetch_queue[(prefetch_head + prefetch_count++) % PREFETCH_SLOTS] = request;
+			if (!superseded) {
+				prefetch_request_t next = {request.stream_id, request.block + 1, request.remaining - 1};
+				prefetch_queue[(prefetch_head + prefetch_count++) % PREFETCH_SLOTS] = next;
+				pthread_cond_broadcast(&prefetch_cond);
 			}
 		}
+		pthread_mutex_unlock(&prefetch_lock);
+		cache_block(data, request.block);
+		pthread_mutex_lock(&prefetch_lock);
 	}
 	pthread_mutex_unlock(&prefetch_lock);
 	free(data);
