@@ -232,7 +232,9 @@ static int httpfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	return 0;
 }
 
-typedef struct read_stream { pthread_mutex_t lock; off_t end; unsigned int streak; } read_stream_t;
+typedef struct read_stream { pthread_mutex_t lock; off_t end; unsigned int streak; unsigned long long id; } read_stream_t;
+static pthread_mutex_t stream_id_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long long next_stream_id = 1;
 
 static int httpfs_open(const char *path, struct fuse_file_info *fi)
 {
@@ -246,15 +248,21 @@ static int httpfs_open(const char *path, struct fuse_file_info *fi)
 	if (!stream) return -ENOMEM;
 	pthread_mutex_init(&stream->lock, NULL);
 	stream->end = -1;
+	pthread_mutex_lock(&stream_id_lock);
+	stream->id = next_stream_id++;
+	pthread_mutex_unlock(&stream_id_lock);
 	fi->fh = (uint64_t)(uintptr_t)stream;
 	return 0;
 }
+
+static void cancel_prefetch(unsigned long long stream_id);
 
 static int httpfs_release(const char *path, struct fuse_file_info *fi)
 {
 	(void)path;
 	read_stream_t *stream = (read_stream_t *)(uintptr_t)fi->fh;
 	if (stream) {
+		cancel_prefetch(stream->id);
 		pthread_mutex_destroy(&stream->lock);
 		free(stream);
 		fi->fh = 0;
@@ -580,13 +588,34 @@ static int cache_block(char *dst, unsigned long long block)
 	return result;
 }
 
-/* Single background prefetch worker. It never outlives fuse_main. */
+/* Bounded FIFO of per-open prefetch requests: one block per turn.
+ * The queue stores numeric IDs, never pointers to released FUSE handles. */
+#define PREFETCH_SLOTS 16
+typedef struct prefetch_request {
+	unsigned long long stream_id, block;
+	unsigned int remaining;
+} prefetch_request_t;
 static pthread_mutex_t prefetch_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t prefetch_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t prefetch_thread;
-static int prefetch_started, prefetch_shutdown, prefetch_pending, prefetch_busy;
-static unsigned long long prefetch_block;
-static unsigned int prefetch_depth;
+static int prefetch_started, prefetch_shutdown;
+static prefetch_request_t prefetch_queue[PREFETCH_SLOTS];
+static unsigned int prefetch_head, prefetch_count;
+
+static void cancel_prefetch(unsigned long long stream_id)
+{
+	pthread_mutex_lock(&prefetch_lock);
+	prefetch_request_t pending[PREFETCH_SLOTS];
+	unsigned int count = 0;
+	for (unsigned int i = 0; i < prefetch_count; ++i) {
+		prefetch_request_t request = prefetch_queue[(prefetch_head + i) % PREFETCH_SLOTS];
+		if (request.stream_id != stream_id) pending[count++] = request;
+	}
+	memcpy(prefetch_queue, pending, count * sizeof(*pending));
+	prefetch_head = 0;
+	prefetch_count = count;
+	pthread_mutex_unlock(&prefetch_lock);
+}
 
 static void *prefetch_worker(void *unused)
 {
@@ -595,40 +624,54 @@ static void *prefetch_worker(void *unused)
 	if (!data) return NULL;
 	pthread_mutex_lock(&prefetch_lock);
 	while (!prefetch_shutdown) {
-		while (!prefetch_pending && !prefetch_shutdown)
+		while (!prefetch_count && !prefetch_shutdown)
 			pthread_cond_wait(&prefetch_cond, &prefetch_lock);
 		if (prefetch_shutdown) break;
-		unsigned long long block = prefetch_block;
-		unsigned int depth = prefetch_depth;
-		prefetch_pending = 0;
-		prefetch_busy = 1;
+		prefetch_request_t request = prefetch_queue[prefetch_head];
+		prefetch_head = (prefetch_head + 1) % PREFETCH_SLOTS;
+		--prefetch_count;
 		pthread_mutex_unlock(&prefetch_lock);
-		for (unsigned int i = 0; i < depth; ++i) {
-			unsigned long long index = block + i;
-			if (index >= ((unsigned long long)httpfs_file.size + CACHE_BLOCK_SIZE - 1) / CACHE_BLOCK_SIZE) break;
-			pthread_mutex_lock(&prefetch_lock);
-			int stop = prefetch_shutdown;
-			pthread_mutex_unlock(&prefetch_lock);
-			if (stop) break;
-			if (cache_block(data, index) < 0) break;
-		}
+		int result = cache_block(data, request.block);
 		pthread_mutex_lock(&prefetch_lock);
-		prefetch_busy = 0;
+		if (result >= 0 && request.remaining > 1 && !prefetch_shutdown &&
+		    request.block + 1 < ((unsigned long long)httpfs_file.size + CACHE_BLOCK_SIZE - 1) / CACHE_BLOCK_SIZE) {
+			int superseded = 0;
+			for (unsigned int i = 0; i < prefetch_count; ++i)
+				if (prefetch_queue[(prefetch_head + i) % PREFETCH_SLOTS].stream_id == request.stream_id)
+					superseded = 1;
+			if (!superseded && prefetch_count < PREFETCH_SLOTS) {
+				request.block++;
+				request.remaining--;
+				prefetch_queue[(prefetch_head + prefetch_count++) % PREFETCH_SLOTS] = request;
+			}
+		}
 	}
 	pthread_mutex_unlock(&prefetch_lock);
 	free(data);
 	return NULL;
 }
 
-static void schedule_prefetch(unsigned long long next, unsigned int depth)
+static void schedule_prefetch(unsigned long long stream_id, unsigned long long next, unsigned int depth)
 {
 	if (next >= ((unsigned long long)httpfs_file.size + CACHE_BLOCK_SIZE - 1) / CACHE_BLOCK_SIZE)
 		return;
 	pthread_mutex_lock(&prefetch_lock);
 	if (prefetch_started && !prefetch_shutdown) {
-		prefetch_block = next;
-		prefetch_depth = depth;
-		prefetch_pending = 1;
+		/* Update an existing queued request instead of starving other streams. */
+		int found = 0;
+		for (unsigned int i = 0; i < prefetch_count; ++i) {
+			prefetch_request_t *item = &prefetch_queue[(prefetch_head + i) % PREFETCH_SLOTS];
+			if (item->stream_id == stream_id) {
+				item->block = next;
+				item->remaining = depth;
+				found = 1;
+				break;
+			}
+		}
+		if (!found && prefetch_count < PREFETCH_SLOTS) {
+			prefetch_request_t request = {stream_id, next, depth};
+			prefetch_queue[(prefetch_head + prefetch_count++) % PREFETCH_SLOTS] = request;
+		}
 		pthread_cond_signal(&prefetch_cond);
 	}
 	pthread_mutex_unlock(&prefetch_lock);
@@ -679,7 +722,7 @@ static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
 				unsigned int depth = stream->streak;
 				pthread_mutex_unlock(&stream->lock);
 				if (depth > 0 && done > 0)
-					schedule_prefetch(((unsigned long long)offset + done + CACHE_BLOCK_SIZE - 1) / CACHE_BLOCK_SIZE, depth);
+					schedule_prefetch(stream->id, ((unsigned long long)offset + done + CACHE_BLOCK_SIZE - 1) / CACHE_BLOCK_SIZE, depth);
 			}
 			return (int)done;
 		}
