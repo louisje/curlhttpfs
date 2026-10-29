@@ -232,6 +232,8 @@ static int httpfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	return 0;
 }
 
+typedef struct read_stream { pthread_mutex_t lock; off_t end; unsigned int streak; } read_stream_t;
+
 static int httpfs_open(const char *path, struct fuse_file_info *fi)
 {
 	if (strcmp(path, httpfs_file.filename) != 0)
@@ -240,6 +242,23 @@ static int httpfs_open(const char *path, struct fuse_file_info *fi)
 	}
 	if ((fi->flags & O_ACCMODE) != O_RDONLY)
 		return -EACCES;
+ 	read_stream_t *stream = calloc(1, sizeof(*stream));
+	if (!stream) return -ENOMEM;
+	pthread_mutex_init(&stream->lock, NULL);
+	stream->end = -1;
+	fi->fh = (uint64_t)(uintptr_t)stream;
+	return 0;
+}
+
+static int httpfs_release(const char *path, struct fuse_file_info *fi)
+{
+	(void)path;
+	read_stream_t *stream = (read_stream_t *)(uintptr_t)fi->fh;
+	if (stream) {
+		pthread_mutex_destroy(&stream->lock);
+		free(stream);
+		fi->fh = 0;
+	}
 	return 0;
 }
 
@@ -567,7 +586,7 @@ static pthread_cond_t prefetch_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t prefetch_thread;
 static int prefetch_started, prefetch_shutdown, prefetch_pending, prefetch_busy;
 static unsigned long long prefetch_block;
-static off_t sequential_end = -1;
+static unsigned int prefetch_depth;
 
 static void *prefetch_worker(void *unused)
 {
@@ -580,10 +599,19 @@ static void *prefetch_worker(void *unused)
 			pthread_cond_wait(&prefetch_cond, &prefetch_lock);
 		if (prefetch_shutdown) break;
 		unsigned long long block = prefetch_block;
+		unsigned int depth = prefetch_depth;
 		prefetch_pending = 0;
 		prefetch_busy = 1;
 		pthread_mutex_unlock(&prefetch_lock);
-		cache_block(data, block);
+		for (unsigned int i = 0; i < depth; ++i) {
+			unsigned long long index = block + i;
+			if (index >= ((unsigned long long)httpfs_file.size + CACHE_BLOCK_SIZE - 1) / CACHE_BLOCK_SIZE) break;
+			pthread_mutex_lock(&prefetch_lock);
+			int stop = prefetch_shutdown;
+			pthread_mutex_unlock(&prefetch_lock);
+			if (stop) break;
+			if (cache_block(data, index) < 0) break;
+		}
 		pthread_mutex_lock(&prefetch_lock);
 		prefetch_busy = 0;
 	}
@@ -592,13 +620,14 @@ static void *prefetch_worker(void *unused)
 	return NULL;
 }
 
-static void schedule_prefetch(unsigned long long next)
+static void schedule_prefetch(unsigned long long next, unsigned int depth)
 {
 	if (next >= ((unsigned long long)httpfs_file.size + CACHE_BLOCK_SIZE - 1) / CACHE_BLOCK_SIZE)
 		return;
 	pthread_mutex_lock(&prefetch_lock);
 	if (prefetch_started && !prefetch_shutdown && !prefetch_pending && !prefetch_busy) {
 		prefetch_block = next;
+		prefetch_depth = depth;
 		prefetch_pending = 1;
 		pthread_cond_signal(&prefetch_cond);
 	}
@@ -641,13 +670,16 @@ static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
 				memcpy(buf + done, block_data + within, amount);
 				done += amount;
 			}
-			if (options.readahead) {
-				pthread_mutex_lock(&prefetch_lock);
-				int sequential = sequential_end == offset || (sequential_end < 0 && offset == 0);
-				sequential_end = offset + (off_t)done;
-				pthread_mutex_unlock(&prefetch_lock);
-				if (sequential && done > 0)
-					schedule_prefetch(((unsigned long long)offset + done + CACHE_BLOCK_SIZE - 1) / CACHE_BLOCK_SIZE);
+			if (options.readahead && fi && fi->fh) {
+				read_stream_t *stream = (read_stream_t *)(uintptr_t)fi->fh;
+				pthread_mutex_lock(&stream->lock);
+				int sequential = stream->end == offset || (stream->end < 0 && offset == 0);
+				stream->streak = sequential ? (stream->streak < 3 ? stream->streak + 1 : 3) : 0;
+				stream->end = offset + (off_t)done;
+				unsigned int depth = stream->streak;
+				pthread_mutex_unlock(&stream->lock);
+				if (depth > 0 && done > 0)
+					schedule_prefetch(((unsigned long long)offset + done + CACHE_BLOCK_SIZE - 1) / CACHE_BLOCK_SIZE, depth);
 			}
 			return (int)done;
 		}
@@ -662,6 +694,7 @@ static struct fuse_operations httpfs_oper = {
 	.getattr	= httpfs_getattr,
 	.readdir	= httpfs_readdir,
 	.open		= httpfs_open,
+	.release = httpfs_release,
 	.read		= httpfs_read,
 	.destroy = httpfs_destroy,
 };
@@ -685,7 +718,7 @@ static void print_httpfs_help(const char *program)
 	       "  filename=NAME       Local filename in the mounted directory (default: URL basename)\\n"
 	       "  cache_dir=DIR       Optional persistent disk cache; requires strong ETag\\n"
 	       "  cache_max_bytes=N   Maximum shared disk cache bytes (default: 0 = unlimited)\\n"
-	       "  readahead=1         Prefetch one block on sequential reads (default: disabled)\\n"
+	       "  readahead=1         Prefetch 1-3 blocks as sequential reads continue (default: disabled)\\n"
 	       "\\nThe quota applies across URLs and ETag versions in cache_dir.\\n"
 	       "HTTP Range reads use 5s connection / 15s request timeouts and up to 3 attempts.\\n"
 	       "Concurrent cache blocks use per-block locks; global eviction is serialized.\\n"
