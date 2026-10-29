@@ -255,3 +255,18 @@ Remaining work:
 - Ubuntu 24.04 throughput: 0.737/0.866/0.833/0.825 MiB/s; 429 counts: 5/5/13/13.
 - Under this artificial rate cap, worker count 2 was fastest in both single trials; increasing concurrency to 3–4 doubled or tripled 429s in some runs without improving throughput. This contrasts with the earlier unconstrained latency benchmarks (3 was best).
 - Therefore keep static default=1; dynamic concurrency should be designed to respond to rate-limit signals rather than assume higher concurrency is universally better. Repeat trials before choosing production thresholds.
+
+## Adaptive Concurrency — future design (2026-10-29)
+
+- Keep `prefetch_workers=N` as the **configured upper bound**, not necessarily the active concurrency. Keep the current default 1 until real-provider measurements justify otherwise.
+- Pass HTTP outcomes (especially 429, Retry-After, timeout and successful requests) from the request layer to the background scheduler without changing foreground read error semantics. Do not infer rate-limit behavior from throughput alone.
+- Design a conservative additive-increase/multiplicative-decrease controller: reduce active speculative requests after 429, respect bounded Retry-After cooldown, increase only after a stable success window, and cap at the configured number.
+- Coordinate cooldown and worker activity under scheduler locks, but do not hold a scheduler lock while doing HTTP I/O. Keep foreground reads prioritized over speculation, and avoid spinning or bursts under rate limits.
+- Test under controlled rate caps, intermittent 429, high latency, low bandwidth, and multiple open streams; evaluate network cost, retransmissions, cache churn, and end-to-end throughput before enabling automatic adjustment.
+- This is a **proposed future direction**, not implemented in the current release.
+
+## Autotools integration — build system plan (2026-10-29)
+
+- Migrate the maintained build entry point to `configure.ac` and `Makefile.am` using autoconf/automake and pkg-config checks for FUSE3, libcurl, and OpenSSL, plus POSIX pthread support.
+- Validate `autoreconf -fi && ./configure && make && make check && make install DESTDIR=...` on the CI Linux matrix. Keep the runtime FUSE integration suite and benchmark scripts.
+- Autotools portability does **not** imply that FUSE3, `flock`, `O_NOFOLLOW`, and Linux-specific runtime assumptions are immediately portable to every OS. Check capabilities explicitly and report unsupported targets.
