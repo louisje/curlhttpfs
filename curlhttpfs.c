@@ -29,12 +29,15 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <time.h>
 #include <openssl/evp.h>
 
 struct options {
 	char *target_url;
 	char *target_filename;
 	char *cache_dir;
+	unsigned long long cache_max_bytes;
 } options;
 
 #define MY_OPT_KEY(t, p, v) { t, offsetof(struct options, p), v }
@@ -43,6 +46,7 @@ static struct fuse_opt httpfs_opts[] = {
 	MY_OPT_KEY("url=%s", target_url, 0),
 	MY_OPT_KEY("filename=%s", target_filename, 0),
 	MY_OPT_KEY("cache_dir=%s", cache_dir, 0),
+	MY_OPT_KEY("cache_max_bytes=%llu", cache_max_bytes, 0),
 	FUSE_OPT_END
 };
 
@@ -299,6 +303,7 @@ static int read_curl_buffer(size_t size, off_t offset, httpfs_buffer_t *buffer)
 static pthread_mutex_t cache_locks[CACHE_LOCK_STRIPES];
 static pthread_once_t cache_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t cache_init_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t cache_prune_lock = PTHREAD_MUTEX_INITIALIZER;
 static void init_cache_locks(void)
 {
 	for (size_t i = 0; i < CACHE_LOCK_STRIPES; ++i)
@@ -337,6 +342,70 @@ static int digest_block(const char *data, size_t length, unsigned char digest[32
 	return EVP_Digest(data, length, digest, &n, EVP_sha256(), NULL) == 1 && n == 32;
 }
 
+/* Per-version quota. Count payload and SHA sidecars; temporary files are not
+ * included. LRU is approximated with the payload's modification time. */
+static int is_block_name(const char *name)
+{
+	if (strlen(name) != 16) return 0;
+	for (size_t i = 0; i < 16; ++i)
+		if (!isxdigit((unsigned char)name[i])) return 0;
+	return 1;
+}
+
+static void cache_touch(const char *path)
+{
+	struct timespec now[2];
+	if (clock_gettime(CLOCK_REALTIME, &now[0]) == 0) {
+		now[1] = now[0];
+		utimensat(AT_FDCWD, path, now, 0);
+	}
+}
+
+static void cache_prune(unsigned long long protected_block)
+{
+	if (!options.cache_max_bytes || !cache_namespace[0]) return;
+	pthread_mutex_lock(&cache_prune_lock);
+	for (;;) {
+		DIR *dir = opendir(cache_namespace);
+		if (!dir) break;
+		unsigned long long used = 0, oldest_block = 0;
+		struct timespec oldest = {0};
+		int candidate = 0;
+		struct dirent *entry;
+		while ((entry = readdir(dir)) != NULL) {
+			if (!is_block_name(entry->d_name)) continue;
+			char path[1200], hash_path[1220];
+			struct stat st, hs;
+			if (snprintf(path, sizeof(path), "%s/%s", cache_namespace, entry->d_name) >= (int)sizeof(path) ||
+			    snprintf(hash_path, sizeof(hash_path), "%s.sha256", path) >= (int)sizeof(hash_path) ||
+			    lstat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+			if (lstat(hash_path, &hs) != 0 || !S_ISREG(hs.st_mode)) continue;
+			used += (unsigned long long)st.st_size + (unsigned long long)hs.st_size;
+			unsigned long long block = strtoull(entry->d_name, NULL, 16);
+			if (block == protected_block) continue;
+			if (!candidate || st.st_mtim.tv_sec < oldest.tv_sec ||
+			    (st.st_mtim.tv_sec == oldest.tv_sec && st.st_mtim.tv_nsec < oldest.tv_nsec)) {
+				candidate = 1;
+				oldest = st.st_mtim;
+				oldest_block = block;
+			}
+		}
+		closedir(dir);
+		if (used <= options.cache_max_bytes || !candidate) break;
+		pthread_once(&cache_once, init_cache_locks);
+		pthread_mutex_t *lock = &cache_locks[oldest_block % CACHE_LOCK_STRIPES];
+		pthread_mutex_lock(lock);
+		char path[1200], hash_path[1220];
+		if (snprintf(path, sizeof(path), "%s/%016llx", cache_namespace, oldest_block) < (int)sizeof(path) &&
+		    snprintf(hash_path, sizeof(hash_path), "%s.sha256", path) < (int)sizeof(hash_path)) {
+			unlink(path);
+			unlink(hash_path);
+		}
+		pthread_mutex_unlock(lock);
+	}
+	pthread_mutex_unlock(&cache_prune_lock);
+}
+
 static int cache_block(char *dst, unsigned long long block)
 {
 	char path[1200], hash_path[1220], tmp[1250], hash_tmp[1250];
@@ -365,6 +434,7 @@ static int cache_block(char *dst, unsigned long long block)
 				if (h == 32 && trailing == EOF &&
 				    digest_block(dst, length, actual) &&
 				    memcmp(actual, expected, 32) == 0) {
+					cache_touch(path);
 					pthread_mutex_unlock(lock);
 					return (int)length;
 				}
@@ -404,6 +474,7 @@ static int cache_block(char *dst, unsigned long long block)
 		}
 	}
 	pthread_mutex_unlock(lock);
+	if (result == (int)length) cache_prune(block);
 	return result;
 }
 
