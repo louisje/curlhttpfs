@@ -192,3 +192,11 @@ Remaining work:
 - Added an integration test with two simultaneous FUSE mount processes using the same remote file and shared cache, each reading a different delayed HTTP range to detect unintended cross-process serialization.
 - Limitations: best-effort quota can temporarily exceed the limit while blocks are busy; lock files persist and are not part of capacity accounting. `flock` is Unix-specific. Startup cleanup, orphan lock-file management, symlink/ownership hardening, and more extensive concurrency stress tests remain outstanding.
 - Do not claim measured speedups without benchmarks; verify each Ubuntu Actions matrix job.
+
+## Optional one-block background read-ahead (2026-10-29)
+
+- Added `-o readahead=1` (default off) for mounts with `cache_dir` and a strong ETag. A dedicated background worker fetches at most one 64-KiB block ahead into the existing validated persistent cache.
+- The first read at offset zero, or an immediately contiguous read, can schedule the next block. A random read starting elsewhere does not schedule speculative traffic. Only one background request can be pending or in flight.
+- The worker uses existing HTTP timeout/retry, per-block interprocess locking, SHA-256 validation, and LRU quota code; completion is not required for the foreground read to succeed.
+- Added integration tests for sequential prefetch and random-access bypass. `--help` includes the new option.
+- Outstanding: real sequential-stream benchmarks, per-open-file rather than global sequence detection, cancellation/reprioritization, tuning of prefetch depth, adaptive disabling on slow networks, and shutdown behavior under a stalled HTTP request. Background requests may use additional bandwidth and cache quota.
