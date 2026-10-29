@@ -28,10 +28,13 @@
 #include <strings.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <sys/stat.h>
+#include <openssl/sha.h>
 
 struct options {
 	char *target_url;
 	char *target_filename;
+	char *cache_dir;
 } options;
 
 #define MY_OPT_KEY(t, p, v) { t, offsetof(struct options, p), v }
@@ -39,6 +42,7 @@ struct options {
 static struct fuse_opt httpfs_opts[] = {
 	MY_OPT_KEY("url=%s", target_url, 0),
 	MY_OPT_KEY("filename=%s", target_filename, 0),
+	MY_OPT_KEY("cache_dir=%s", cache_dir, 0),
 	FUSE_OPT_END
 };
 
@@ -287,6 +291,76 @@ static int read_curl_buffer(size_t size, off_t offset, httpfs_buffer_t *buffer)
 	return -EIO;
 }
 
+/* Optional 64-KiB on-disk block cache, enabled only for strong ETags.
+ * Each mount probes the remote object before using any cached blocks. */
+#define CACHE_BLOCK_SIZE 65536U
+static pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static char cache_namespace[1024];
+
+static int cache_init(void)
+{
+	unsigned char digest[SHA256_DIGEST_LENGTH];
+	SHA256_CTX ctx;
+	char hex[SHA256_DIGEST_LENGTH * 2 + 1];
+	if (!options.cache_dir || !options.cache_dir[0] ||
+	    httpfs_file.etag[0] != '"' ) return 0;
+	if (mkdir(options.cache_dir, 0700) != 0 && errno != EEXIST) return -errno;
+	SHA256_Init(&ctx);
+	SHA256_Update(&ctx, options.target_url, strlen(options.target_url));
+	SHA256_Update(&ctx, "\0", 1);
+	SHA256_Update(&ctx, httpfs_file.etag, strlen(httpfs_file.etag));
+	SHA256_Final(digest, &ctx);
+	for (size_t i = 0; i < sizeof(digest); ++i)
+		snprintf(hex + i * 2, 3, "%02x", digest[i]);
+	if (snprintf(cache_namespace, sizeof(cache_namespace), "%s/%s",
+	             options.cache_dir, hex) >= (int)sizeof(cache_namespace)) return -ENAMETOOLONG;
+	if (mkdir(cache_namespace, 0700) != 0 && errno != EEXIST) return -errno;
+	return 0;
+}
+
+static int cache_block(char *dst, unsigned long long block)
+{
+	char path[1200], tmp[1250];
+	unsigned long long offset = block * CACHE_BLOCK_SIZE;
+	size_t length = (size_t)((unsigned long long)httpfs_file.size - offset);
+	if (length > CACHE_BLOCK_SIZE) length = CACHE_BLOCK_SIZE;
+	if (snprintf(path, sizeof(path), "%s/%016llx", cache_namespace, block) >= (int)sizeof(path))
+		return -ENAMETOOLONG;
+	pthread_mutex_lock(&cache_lock);
+	FILE *file = fopen(path, "rb");
+	if (file) {
+		size_t got = fread(dst, 1, length, file);
+		int extra = fgetc(file);
+		fclose(file);
+		if (got == length && extra == EOF) {
+			pthread_mutex_unlock(&cache_lock);
+			return (int)length;
+		}
+	}
+	httpfs_buffer_t buffer = {dst, 0, length};
+	int result = read_curl_buffer(length, (off_t)offset, &buffer);
+	if (result == (int)length) {
+		if (snprintf(tmp, sizeof(tmp), "%s/.tmp-XXXXXX", cache_namespace) < (int)sizeof(tmp)) {
+			int fd = mkstemp(tmp);
+			if (fd >= 0) {
+				size_t written = 0;
+				while (written < length) {
+					ssize_t n = write(fd, dst + written, length - written);
+					if (n <= 0) break;
+					written += (size_t)n;
+				}
+				if (written == length && fsync(fd) == 0 && close(fd) == 0) {
+					fd = -1;
+					if (rename(tmp, path) != 0) unlink(tmp);
+				}
+				if (fd >= 0) { close(fd); unlink(tmp); }
+			}
+		}
+	}
+	pthread_mutex_unlock(&cache_lock);
+	return result;
+}
+
 static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
                       struct fuse_file_info *fi)
 {
@@ -301,6 +375,26 @@ static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
 	if ((curl_off_t)size > httpfs_file.size - (curl_off_t)offset)
 		size = (size_t)(httpfs_file.size - (curl_off_t)offset);
 	if (size > INT_MAX) size = INT_MAX;
+	if (options.cache_dir && options.cache_dir[0]) {
+		if (!cache_namespace[0] && cache_init() != 0) return -EIO;
+		if (cache_namespace[0]) {
+			size_t done = 0;
+			char block_data[CACHE_BLOCK_SIZE];
+			while (done < size) {
+				unsigned long long position = (unsigned long long)offset + done;
+				unsigned long long block = position / CACHE_BLOCK_SIZE;
+				size_t within = (size_t)(position % CACHE_BLOCK_SIZE);
+				int got = cache_block(block_data, block);
+				if (got < 0) return got;
+				if ((size_t)got <= within) return -EIO;
+				size_t amount = (size_t)got - within;
+				if (amount > size - done) amount = size - done;
+				memcpy(buf + done, block_data + within, amount);
+				done += amount;
+			}
+			return (int)done;
+		}
+	}
 	httpfs_buffer_t buffer = {buf, 0, size};
 	return read_curl_buffer(size, offset, &buffer);
 }
