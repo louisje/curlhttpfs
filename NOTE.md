@@ -132,3 +132,22 @@ Remaining work:
 - [ ] Handle a HEAD-disabled empty-file server or unsupported HEAD with a separate policy.
 - [ ] Harden unexpected HTTP encoding and oversized error response handling.
 - [ ] Verify GitHub Actions Linux matrix for the above changes, including actual FUSE integration tests.
+
+## First persistent cache milestone (2026-10-29)
+
+- Added optional `-o cache_dir=/path/to/cache` for a persistent, on-disk, 64 KiB block cache. No cache is enabled by default.
+- On each mount, the HTTP metadata probe obtains the current ETag. Only objects with a **strong quoted ETag** enter the persistent cache; unversioned/weak-ETag objects continue direct HTTP reads.
+- Cache directory namespace is SHA-256 of URL and ETag; blocks are stored with atomic temporary-file rename, and checked for expected length before reuse. Successful downloads are reused across unmount/remount of the same URL and ETag.
+- Each cache miss fetches the entire aligned block; the final block is smaller. A local HTTP fixture now checks the repeated mount uses only the metadata probe instead of redownloading its cached block.
+- The initial implementation is intentionally minimal: no eviction, disk quota, encryption, offline mount, inter-process locking, metadata index, or configurable block size.
+- Security note: cache files are local plaintext; use a private cache directory. Do not use an untrusted shared directory or assume existing cache data is cryptographically authenticated.
+
+### Remaining cache engineering tasks
+
+- [ ] Verify both Ubuntu Actions jobs pass, including remount-cache integration test.
+- [ ] Replace deprecated OpenSSL SHA256 context functions with EVP digest API.
+- [ ] Add tests for changed ETag across remount, weak or absent ETag bypass, truncated/corrupted cache files, and multi-process writers.
+- [ ] Improve cache directory validation (symlinks, ownership, permissions), persist integrity metadata/hashes, safe eviction and capacity controls.
+- [ ] Separate the caching core from the FUSE adapter before macOS/Windows ports.
+- [ ] Coordinate concurrent readers/cache misses without serializing all reads; only the initial version uses one mutex for disk-cache operations.
+- [ ] Consider Last-Modified fallback and behavior when a remote file changes during a mount.
