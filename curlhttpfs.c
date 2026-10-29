@@ -656,6 +656,8 @@ static int httpfs_read(const char *path, char *buf, size_t size, off_t offset,
 	return read_curl_buffer(size, offset, &buffer);
 }
 
+static void httpfs_destroy(void *private_data);
+
 static struct fuse_operations httpfs_oper = {
 	.getattr	= httpfs_getattr,
 	.readdir	= httpfs_readdir,
