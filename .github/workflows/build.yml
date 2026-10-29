@@ -16,7 +16,11 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config fuse3 libfuse3-dev libcurl4-openssl-dev
+          sudo apt-get install -y build-essential autoconf automake libtool pkg-config fuse3 libfuse3-dev libcurl4-openssl-dev libssl-dev
+      - name: Autotools bootstrap and configure
+        run: |
+          autoreconf -fi
+          ./configure
       - name: Build
         run: make
       - name: Smoke test
@@ -27,6 +31,12 @@ jobs:
         run: |
           make clean
           make
+      - name: Autotools install staging
+        run: |
+          make install DESTDIR="$RUNNER_TEMP/staging"
+          test -x "$RUNNER_TEMP/staging/usr/local/bin/curlhttpfs"
+      - name: Autotools check
+        run: make check
       - name: Check FUSE device
         run: |
           ls -l /dev/fuse
