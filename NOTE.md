@@ -224,3 +224,10 @@ Remaining work:
 - The existing FIFO, per-stream request coalescing, ETag verification, block-level `flock`, SHA-256 validation, and LRU quota remain in effect; foreground reads are still independent of prefetch success.
 - Added tests that mount with three workers and check that delayed HTTP Range requests overlap in real time, not just that reads eventually succeed.
 - Performance caveat: concurrency is bounded, but actual end-to-end speedup has **not** been established by a controlled benchmark. Multiple workers can increase network, disk, and server load; cache evictions may make speculative prefetch less useful. Worker count of 1 preserves prior behavior.
+
+## Controlled worker-count benchmark (2026-10-29)
+
+- Added `tests/benchmark_workers.py` to compare `prefetch_workers=1,2,3,4` against a loopback HTTP Range server with a controlled per-request delay. Every trial creates a fresh cache directory, mounts FUSE, reads the same data and verifies the SHA-256 output agrees across configurations.
+- Added CI measurements on Ubuntu 22.04 and 24.04 with `--size-mib 1 --latency-ms 15 --runs 1`, uploaded as `benchmark-workers-<os>.json` artifacts; measurements are informational, not pass/fail speed thresholds.
+- Re-run for stronger comparisons with `python3 tests/benchmark_workers.py --size-mib 16 --latency-ms 40 --runs 5 --output results.json`. Prefer several repetitions and a fixed environment; the workflow's one-run smoke benchmark is not sufficient to choose an optimal default.
+- Caution: loopback latency and workload differ from real remote storage; file-system cache, network jitter, and delayed requests may affect results. Do not infer a real-world speedup from CI alone. Keep default worker count at 1 pending evidence.
