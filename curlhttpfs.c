@@ -392,6 +392,8 @@ static void cache_touch(const char *path)
 }
 
 /* The quota is best-effort between independent processes. */
+static int block_file_lock(const char *directory, unsigned long long block, int nonblock);
+
 static void cache_prune(unsigned long long protected_block)
 {
 	if (!options.cache_max_bytes || !options.cache_dir || !cache_namespace[0]) return;
