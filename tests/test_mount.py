@@ -479,17 +479,18 @@ class FuseIntegrationTest(unittest.TestCase):
         with self.temporary_mount("cache", cache_dir=cache_dir, readahead=1) as path:
             with open(path, "rb", buffering=0) as f:
                 for _ in range(3):
-                    self.assertEqual(f.read(128), PAYLOAD[f.tell()-128:f.tell()])
+                    start = f.tell()
+                    self.assertEqual(f.read(65536), PAYLOAD[start:start + 65536])
                     time.sleep(0.15)
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
                     blocks = {p.name for p in cache_dir.rglob("*") if p.is_file()
                               and re.fullmatch(r"[0-9a-f]{16}", p.name)}
-                    if "0000000000000003" in blocks:
+                    if "0000000000000005" in blocks:
                         break
                     time.sleep(0.05)
                 else:
-                    self.fail("adaptive readahead did not fetch three future blocks")
+                    self.fail("adaptive readahead did not fetch three future blocks after a sequential stream")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
