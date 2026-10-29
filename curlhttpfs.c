@@ -40,6 +40,7 @@ struct options {
 	char *cache_dir;
 	unsigned long long cache_max_bytes;
 	int readahead;
+	int prefetch_workers;
 } options;
 
 #define MY_OPT_KEY(t, p, v) { t, offsetof(struct options, p), v }
@@ -50,6 +51,7 @@ static struct fuse_opt httpfs_opts[] = {
 	MY_OPT_KEY("cache_dir=%s", cache_dir, 0),
 	MY_OPT_KEY("cache_max_bytes=%llu", cache_max_bytes, 0),
 	MY_OPT_KEY("readahead=%d", readahead, 0),
+	MY_OPT_KEY("prefetch_workers=%d", prefetch_workers, 0),
 	FUSE_OPT_END
 };
 
@@ -591,13 +593,14 @@ static int cache_block(char *dst, unsigned long long block)
 /* Bounded FIFO of per-open prefetch requests: one block per turn.
  * The queue stores numeric IDs, never pointers to released FUSE handles. */
 #define PREFETCH_SLOTS 16
+#define MAX_PREFETCH_WORKERS 4
 typedef struct prefetch_request {
 	unsigned long long stream_id, block;
 	unsigned int remaining;
 } prefetch_request_t;
 static pthread_mutex_t prefetch_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t prefetch_cond = PTHREAD_COND_INITIALIZER;
-static pthread_t prefetch_thread;
+static pthread_t prefetch_threads[MAX_PREFETCH_WORKERS];
 static int prefetch_started, prefetch_shutdown;
 static prefetch_request_t prefetch_queue[PREFETCH_SLOTS];
 static unsigned int prefetch_head, prefetch_count;
@@ -672,7 +675,7 @@ static void schedule_prefetch(unsigned long long stream_id, unsigned long long n
 			prefetch_request_t request = {stream_id, next, depth};
 			prefetch_queue[(prefetch_head + prefetch_count++) % PREFETCH_SLOTS] = request;
 		}
-		pthread_cond_signal(&prefetch_cond);
+		pthread_cond_broadcast(&prefetch_cond);
 	}
 	pthread_mutex_unlock(&prefetch_lock);
 }
@@ -749,12 +752,12 @@ static void httpfs_destroy(void *private_data)
 	prefetch_shutdown = 1;
 	pthread_cond_signal(&prefetch_cond);
 	pthread_mutex_unlock(&prefetch_lock);
-	if (prefetch_started) pthread_join(prefetch_thread, NULL);
+	for (int i = 0; i < prefetch_started; ++i) pthread_join(prefetch_threads[i], NULL);
 }
 
 static void print_httpfs_help(const char *program)
 {
-	printf("Usage: %s -o url=URL[,filename=NAME][,cache_dir=DIR][,cache_max_bytes=N][,readahead=1] MOUNTPOINT [FUSE options]\\n"
+	printf("Usage: %s -o url=URL[,filename=NAME][,cache_dir=DIR][,cache_max_bytes=N][,readahead=1][,prefetch_workers=N] MOUNTPOINT [FUSE options]\\n"
 	       "\\nRead-only HTTP Range filesystem (64 KiB disk cache blocks).\\n"
 	       "\\nHTTPFS options (-o key=value):\\n"
 	       "  url=URL             Remote HTTP(S) file (required)\\n"
@@ -762,6 +765,7 @@ static void print_httpfs_help(const char *program)
 	       "  cache_dir=DIR       Optional persistent disk cache; requires strong ETag\\n"
 	       "  cache_max_bytes=N   Maximum shared disk cache bytes (default: 0 = unlimited)\\n"
 	       "  readahead=1         Prefetch 1-3 blocks as sequential reads continue (default: disabled)\\n"
+	       "  prefetch_workers=N   Parallel HTTP prefetch workers (1-4, default: 1; requires readahead=1)\\n"
 	       "\\nThe quota applies across URLs and ETag versions in cache_dir.\\n"
 	       "HTTP Range reads use 5s connection / 15s request timeouts and up to 3 attempts.\\n"
 	       "Concurrent cache blocks use per-block locks; global eviction is serialized.\\n"
@@ -819,8 +823,20 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+	if (options.prefetch_workers < 0 || options.prefetch_workers > MAX_PREFETCH_WORKERS) {
+		fprintf(stderr, "prefetch_workers must be between 1 and 4\\n");
+		return 1;
+	}
 	if (options.readahead && options.cache_dir && options.cache_dir[0]) {
-		if (pthread_create(&prefetch_thread, NULL, prefetch_worker, NULL) == 0) prefetch_started = 1;
+		int workers = options.prefetch_workers ? options.prefetch_workers : 1;
+		if (workers < 1 || workers > MAX_PREFETCH_WORKERS) {
+			fprintf(stderr, "prefetch_workers must be between 1 and 4\\n");
+			return 1;
+		}
+		for (int i = 0; i < workers; ++i) {
+			if (pthread_create(&prefetch_threads[i], NULL, prefetch_worker, NULL) != 0) break;
+			prefetch_started++;
+		}
 	}
 
 	if (fuse_main(args.argc, args.argv, &httpfs_oper, NULL))
