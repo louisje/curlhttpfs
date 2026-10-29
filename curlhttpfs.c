@@ -113,6 +113,7 @@ typedef struct response_headers {
 	int seen;
 	char etag[256];
 	unsigned long long start, end, total;
+	unsigned int retry_after_seconds;
 } response_headers_t;
 
 static size_t parse_range_header(char *line, size_t size, size_t count, void *userdata)
@@ -124,6 +125,7 @@ static size_t parse_range_header(char *line, size_t size, size_t count, void *us
 	if (n >= 5 && strncmp(line, "HTTP/", 5) == 0) {
 		headers->seen = 0;
 		headers->etag[0] = '\0';
+		headers->retry_after_seconds = 0;
 	}
 	if (n >= 5 && strncasecmp(line, "ETag:", 5) == 0) {
 		size_t begin = 5, end = n;
@@ -133,6 +135,12 @@ static size_t parse_range_header(char *line, size_t size, size_t count, void *us
 			memcpy(headers->etag, line + begin, end - begin);
 			headers->etag[end - begin] = '\0';
 		}
+	}
+	if (n >= 12 && strncasecmp(line, "Retry-After:", 12) == 0) {
+		unsigned int seconds = 0;
+		char extra;
+		if (sscanf(line + 12, " %u %c", &seconds, &extra) == 1 && seconds <= 5)
+			headers->retry_after_seconds = seconds;
 	}
 	if (n >= 14 && strncasecmp(line, "Content-Range:", 14) == 0) {
 		if (sscanf(line + 14, " bytes %llu-%llu/%llu %c", &a, &b, &c, &extra) == 3) {
@@ -191,7 +199,12 @@ static int fetch_metadata(void)
 			}
 		}
 		if (!retryable(code, status)) return -EIO;
-		if (attempt + 1 < HTTP_RETRIES) usleep((useconds_t)(100000U << attempt));
+		if (attempt + 1 < HTTP_RETRIES) {
+			unsigned int delay = 100000U << attempt;
+			if (status == 429 && headers.retry_after_seconds)
+				delay = headers.retry_after_seconds * 1000000U;
+			usleep((useconds_t)delay);
+		}
 	}
 	return -EIO;
 }
