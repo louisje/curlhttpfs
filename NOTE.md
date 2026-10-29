@@ -231,3 +231,12 @@ Remaining work:
 - Added CI measurements on Ubuntu 22.04 and 24.04 with `--size-mib 1 --latency-ms 15 --runs 1`, uploaded as `benchmark-workers-<os>.json` artifacts; measurements are informational, not pass/fail speed thresholds.
 - Re-run for stronger comparisons with `python3 tests/benchmark_workers.py --size-mib 16 --latency-ms 40 --runs 5 --output results.json`. Prefer several repetitions and a fixed environment; the workflow's one-run smoke benchmark is not sufficient to choose an optimal default.
 - Caution: loopback latency and workload differ from real remote storage; file-system cache, network jitter, and delayed requests may affect results. Do not infer a real-world speedup from CI alone. Keep default worker count at 1 pending evidence.
+
+## First worker-count results and wider matrix (2026-10-29)
+
+- Actual measured loopback results from Actions run 40820736708, with 1 MiB file, 15 ms simulated HTTP Range latency, and **one trial per worker count**:
+  - Ubuntu 22.04: workers 1/2/3/4 = 2.718 / 3.536 / 3.808 / 3.791 MiB/s.
+  - Ubuntu 24.04: workers 1/2/3/4 = 2.849 / 3.631 / 4.017 / 3.918 MiB/s.
+- Both single-run measurements favor 3 over 4, but the sample size is inadequate for choosing the production default or enabling runtime autotuning.
+- Extend CI to two repeatable scenarios: 1 MiB at 15 ms, and 2 MiB at 40 ms; two fresh-cache repetitions per worker count. Each scenario exports an independent JSON artifact. Differences reflect simulated HTTP latency, not a guarantee of real-world storage performance.
+- Keep `prefetch_workers` default = 1. Consider automatic adjustment only after larger repeated trials, server-side request-rate limits, bandwidth costs, cache hit rates, and real provider behavior have been characterized.
