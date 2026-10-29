@@ -58,7 +58,8 @@ struct httpfs_file {
 	"/",
 	0,
 	0,
-	0
+	0,
+	{0}
 };
 
 typedef struct httpfs_buffer {
@@ -309,7 +310,7 @@ static int cache_init(void)
 {
 	unsigned char digest[32];
 	EVP_MD_CTX *ctx;
-	char hex[SHA256_DIGEST_LENGTH * 2 + 1];
+	char hex[32 * 2 + 1];
 	if (!options.cache_dir || !options.cache_dir[0] ||
 	    httpfs_file.etag[0] != '"' ) return 0;
 	if (mkdir(options.cache_dir, 0700) != 0 && errno != EEXIST) return -errno;
