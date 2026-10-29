@@ -35,6 +35,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(416)
             return
         if end - start + 1 != 1:
+            with self.server.limit_lock:
+                now = time.monotonic()
+                if now - self.server.window_start >= 1:
+                    self.server.window_start = now
+                    self.server.window_requests = 0
+                self.server.window_requests += 1
+                limited = self.server.rate_limit > 0 and self.server.window_requests > self.server.rate_limit
+                if limited:
+                    self.server.throttled += 1
+            if limited:
+                self.send_response(429)
+                self.send_header("Content-Length", "0")
+                self.send_header("Retry-After", "1")
+                self.end_headers()
+                return
             time.sleep(self.server.latency)
         self.send_response(206)
         self.send_header("ETag", '"benchmark-v1"')
@@ -49,6 +64,10 @@ def mounted(binary, mount, url, cache, workers):
                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 def run(binary, server, size, workers, latency):
+    with server.limit_lock:
+        server.window_start = time.monotonic()
+        server.window_requests = 0
+        server.throttled = 0
     with tempfile.TemporaryDirectory(prefix="curlhttpfs-bench-") as tmp:
         mount = Path(tmp) / "mnt"
         mount.mkdir()
@@ -72,7 +91,9 @@ def run(binary, server, size, workers, latency):
                         raise RuntimeError("Unexpected short read")
                     h.update(data)
             elapsed = time.monotonic() - began
-            return {"workers": workers, "seconds": elapsed,
+            with server.limit_lock:
+                throttled = server.throttled
+            return {"workers": workers, "throttled_429": throttled, "seconds": elapsed,
                     "mib_per_sec": (size / 1048576) / elapsed,
                     "sha256": h.hexdigest(), "latency_seconds": latency}
         finally:
@@ -91,15 +112,21 @@ def main():
     parser.add_argument("--size-mib", type=int, default=2)
     parser.add_argument("--latency-ms", type=float, default=20)
     parser.add_argument("--runs", type=int, default=2)
+    parser.add_argument("--rate-limit", type=int, default=0, help="Max block Range requests per 1s window; 0 disables")
     parser.add_argument("--output", default=None)
     parser.add_argument("--binary", default="./curlhttpfs")
     args = parser.parse_args()
-    if args.size_mib < 1 or args.runs < 1 or args.latency_ms < 0:
+    if args.size_mib < 1 or args.runs < 1 or args.latency_ms < 0 or args.rate_limit < 0:
         parser.error("size and runs must be positive, latency nonnegative")
     binary = Path(args.binary).resolve()
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.size = args.size_mib * 1048576
     server.latency = args.latency_ms / 1000
+    server.rate_limit = args.rate_limit
+    server.limit_lock = threading.Lock()
+    server.window_start = time.monotonic()
+    server.window_requests = 0
+    server.throttled = 0
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     samples = []
@@ -116,7 +143,7 @@ def main():
         raise RuntimeError("Content differs between worker configurations")
     summary = {
         "environment": "loopback HTTP with fixed per-range delay; cold disk cache per trial",
-        "size_mib": args.size_mib, "latency_ms": args.latency_ms,
+        "size_mib": args.size_mib, "latency_ms": args.latency_ms, "rate_limit": args.rate_limit,
         "runs_per_worker": args.runs, "samples": samples,
         "median_mib_per_sec": {str(i): statistics.median(
             x["mib_per_sec"] for x in samples if x["workers"] == i
