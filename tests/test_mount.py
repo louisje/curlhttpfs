@@ -193,13 +193,15 @@ class FuseIntegrationTest(unittest.TestCase):
             self.assertEqual(data, PAYLOAD[start:start + 4096])
 
     @contextlib.contextmanager
-    def temporary_mount(self, name, cache_dir=None):
+    def temporary_mount(self, name, cache_dir=None, cache_max_bytes=None):
         mount = Path(self.tmp.name) / name
         mount.mkdir(exist_ok=True)
         port = self.server.server_address[1]
         opts = f"url=http://127.0.0.1:{port}/{name}.bin,filename=remote.bin"
         if cache_dir is not None:
             opts += f",cache_dir={cache_dir}"
+        if cache_max_bytes is not None:
+            opts += f",cache_max_bytes={cache_max_bytes}"
         proc = subprocess.Popen(
             [str(Path("curlhttpfs").resolve()), "-f", "-s",
              "-o", opts,
@@ -315,6 +317,25 @@ class FuseIntegrationTest(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=8) as pool:
                 actual = list(pool.map(read_at, offsets))
             self.assertEqual(actual, [PAYLOAD[i:i+256] for i in offsets])
+
+    def test_cache_quota_evicts_oldest_block(self):
+        cache_dir = Path(self.tmp.name) / "quota-cache"
+        quota = 66000  # One 64-KiB block plus its SHA-256 sidecar
+        with self.temporary_mount("cache", cache_dir=cache_dir,
+                                  cache_max_bytes=quota) as path:
+            with open(path, "rb", buffering=0) as f:
+                self.assertEqual(f.read(100), PAYLOAD[:100])
+                f.seek(65536 + 10)
+                self.assertEqual(f.read(100), PAYLOAD[65546:65646])
+            blocks = [p for p in cache_dir.rglob("*")
+                      if p.is_file() and len(p.name) == 16]
+            self.assertEqual(len(blocks), 1)
+            self.assertEqual(blocks[0].name, "0000000000000001")
+        with self.temporary_mount("cache", cache_dir=cache_dir,
+                                  cache_max_bytes=quota) as path:
+            with open(path, "rb", buffering=0) as f:
+                f.seek(65536 + 10)
+                self.assertEqual(f.read(100), PAYLOAD[65546:65646])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
